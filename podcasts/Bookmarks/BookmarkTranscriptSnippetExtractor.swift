@@ -14,6 +14,15 @@ struct BookmarkTranscriptSnippet {
     }
 }
 
+/// A captured passage together with how it was found, which is what the analytics
+/// for the capture describe.
+struct BookmarkPassageCapture {
+    let snippet: BookmarkTranscriptSnippet
+
+    /// Whether the transcript was machine generated rather than supplied by the publisher
+    let isGeneratedTranscript: Bool
+}
+
 /// Extracts the transcript text surrounding a bookmark's position, used as the
 /// input for generating a bookmark title.
 ///
@@ -31,20 +40,28 @@ struct BookmarkTranscriptSnippetExtractor {
     /// Snippets with fewer words than this carry too little signal to generate a meaningful title from
     static let minimumWordCount = 10
 
-    func snippet(forTime time: TimeInterval, episode: BaseEpisode) async -> BookmarkTranscriptSnippet? {
+    /// The passage surrounding the given playback time, or why one couldn't be found.
+    func capture(forTime time: TimeInterval, episode: BaseEpisode) async -> Result<BookmarkPassageCapture, BookmarkPassageFailureReason> {
         let transcriptManager = TranscriptManager(episodeUUID: episode.uuid, podcastUUID: episode.parentIdentifier())
         guard let model = try? await transcriptManager.loadTranscript() else {
-            return nil
+            return .failure(.transcriptUnavailable)
         }
 
         // Only generated transcripts have a reference fingerprint to re-anchor against.
+        let isGenerated = transcriptManager.isDisplayingGeneratedTranscript
         var center = time
-        if transcriptManager.isDisplayingGeneratedTranscript, FeatureFlag.syncedTranscripts.enabled,
+        if isGenerated, FeatureFlag.syncedTranscripts.enabled,
            let referenceTime = await FingerprintTimingManager.shared.resolveReferenceTime(forPlaybackTime: time, episode: episode) {
             center = referenceTime
         }
 
-        return Self.extractSnippet(from: model, at: center)
+        return Self.extractSnippet(from: model, at: center).map {
+            BookmarkPassageCapture(snippet: $0, isGeneratedTranscript: isGenerated)
+        }
+    }
+
+    func snippet(forTime time: TimeInterval, episode: BaseEpisode) async -> BookmarkTranscriptSnippet? {
+        try? await capture(forTime: time, episode: episode).get().snippet
     }
 
     func snippet(forPassage passage: String, at location: Int?, episode: BaseEpisode) async -> BookmarkTranscriptSnippet? {
@@ -57,13 +74,13 @@ struct BookmarkTranscriptSnippetExtractor {
         return BookmarkTranscriptSnippet(transcript: model, range: range)
     }
 
-    static func extractSnippet(from model: TranscriptModel, at time: TimeInterval) -> BookmarkTranscriptSnippet? {
+    static func extractSnippet(from model: TranscriptModel, at time: TimeInterval) -> Result<BookmarkTranscriptSnippet, BookmarkPassageFailureReason> {
         let windowStart = max(0, time - backwardWindowSeconds)
         let windowEnd = time + forwardWindowSeconds
 
         let overlapping = model.cues.filter { $0.startTime < windowEnd && $0.endTime > windowStart }
         guard let first = overlapping.first, let last = overlapping.last else {
-            return nil
+            return .failure(.noTranscriptAtPosition)
         }
 
         let location = first.characterRange.location
@@ -72,9 +89,9 @@ struct BookmarkTranscriptSnippetExtractor {
 
         let snippet = BookmarkTranscriptSnippet(transcript: model, range: snappedRange)
         guard snippet.text.split(whereSeparator: \.isWhitespace).count >= minimumWordCount else {
-            return nil
+            return .failure(.passageTooShort)
         }
-        return snippet
+        return .success(snippet)
     }
 
     static func sentenceRange(containing index: Int, in text: String) -> NSRange {

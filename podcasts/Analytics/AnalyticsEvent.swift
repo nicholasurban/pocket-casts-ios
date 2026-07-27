@@ -906,6 +906,16 @@ enum AnalyticsEvent: String {
     case bookmarkDeleteFormShown
     case bookmarkDeleteFormDismissed
     case bookmarkDeleteFormSubmitted
+    case bookmarkDetailsShown
+
+    // MARK: - Smart Bookmarks
+    case bookmarkPassageCaptured
+    case bookmarkPassageCaptureFailed
+    case bookmarkTitleGenerated
+    case bookmarkTitleGenerationFailed
+    case bookmarkTitleSuggestionTapped
+    case bookmarkPassageEditorShown
+    case bookmarkPassageEditorDismissed
 
     // MARK: - Headphone Controls
     case settingsHeadphoneControlsShown

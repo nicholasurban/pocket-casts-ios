@@ -2725,7 +2725,7 @@ extension PlaybackManager {
         }
 
         let currentTime = currentTime()
-        bookmarkManager.add(to: episode, at: currentTime)
+        bookmarkManager.add(to: episode, at: currentTime, source: source)
 
         playBookmarkCreationSoundIfNeeded(source: source)
 
