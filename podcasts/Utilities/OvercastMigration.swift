@@ -65,7 +65,11 @@ enum OvercastMigration {
         let enclosureURL: String
         let advertisedDuration: Int
         let progressSeconds: Int
-        let archived: Bool
+        /// This is Overcast's raw `userDeleted` flag. It is intentionally not
+        /// treated as Pocket Casts archive state: in the inspected source it
+        /// marks most historical feed entries, so applying it would hide a
+        /// large amount of valid destination content.
+        let overcastDeleted: Bool
         let starredTime: Int64
         let downloadRequested: Bool
         let playbackState: PlaybackState
@@ -83,6 +87,27 @@ enum OvercastMigration {
             case starredTime = "starred_time"
             case downloadRequested = "download_requested"
             case playbackState = "playback_state"
+            case overcastDeleted = "overcast_deleted"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            sourceEpisodeId = try container.decode(Int64.self, forKey: .sourceEpisodeId)
+            sourcePodcastId = try container.decode(Int64.self, forKey: .sourcePodcastId)
+            feedURL = try container.decodeIfPresent(String.self, forKey: .feedURL)
+            podcastTitle = try container.decode(String.self, forKey: .podcastTitle)
+            publishedTime = try container.decode(Int64.self, forKey: .publishedTime)
+            title = try container.decode(String.self, forKey: .title)
+            enclosureURL = try container.decode(String.self, forKey: .enclosureURL)
+            advertisedDuration = try container.decode(Int.self, forKey: .advertisedDuration)
+            progressSeconds = try container.decode(Int.self, forKey: .progressSeconds)
+            // Bundles made before the field was clarified used `archived`.
+            overcastDeleted = try container.decodeIfPresent(Bool.self, forKey: .overcastDeleted)
+                ?? container.decodeIfPresent(Bool.self, forKey: .archived)
+                ?? false
+            starredTime = try container.decode(Int64.self, forKey: .starredTime)
+            downloadRequested = try container.decode(Bool.self, forKey: .downloadRequested)
+            playbackState = try container.decode(PlaybackState.self, forKey: .playbackState)
         }
     }
 
@@ -125,6 +150,7 @@ enum OvercastMigration {
         let statefulEpisodes: Int
         let downloadedEpisodes: Int
         let requiredRefreshes: Int
+        let ignoredOvercastDeletionMarkers: Int
     }
 
     struct Reconciliation {
@@ -133,7 +159,7 @@ enum OvercastMigration {
         var matchedEpisodes = 0
         var unresolvedEpisodes = 0
         var restoredPlaybackStates = 0
-        var restoredArchivedStates = 0
+        var ignoredOvercastDeletionMarkers = 0
         var restoredStars = 0
         var queuedRedownloads = 0
     }
@@ -143,7 +169,7 @@ enum OvercastMigration {
         let sourceFeeds = bundle.subscriptions.compactMap { canonicalFeedURL($0.feedURL) }
         let matched = sourceFeeds.filter(destinationFeeds.contains).count
         let statefulEpisodes = bundle.episodes.filter {
-            $0.playbackState != .notStarted || $0.archived || $0.starredTime > 0
+            $0.playbackState != .notStarted || $0.starredTime > 0
         }.count
         return DryRun(
             sourceSubscriptions: sourceFeeds.count,
@@ -151,7 +177,8 @@ enum OvercastMigration {
             unresolvedSubscriptions: sourceFeeds.count - matched,
             statefulEpisodes: statefulEpisodes,
             downloadedEpisodes: bundle.episodes.filter(\.downloadRequested).count,
-            requiredRefreshes: Set(bundle.episodes.map(\.sourcePodcastId)).count
+            requiredRefreshes: Set(bundle.episodes.map(\.sourcePodcastId)).count,
+            ignoredOvercastDeletionMarkers: bundle.episodes.filter(\.overcastDeleted).count
         )
     }
 
@@ -162,7 +189,8 @@ enum OvercastMigration {
         bundle: Bundle,
         podcasts: [Podcast],
         dataManager: DataManager = .sharedManager,
-        downloadManager: DownloadManager = .shared
+        downloadManager: DownloadManager = .shared,
+        restoreDownloads: Bool = false
     ) -> Reconciliation {
         var report = Reconciliation()
         let destinationByFeed = Dictionary(
@@ -191,7 +219,7 @@ enum OvercastMigration {
             )
         }
 
-        for source in bundle.episodes where shouldRestore(source) {
+        for source in bundle.episodes where shouldRestore(source, restoreDownloads: restoreDownloads) {
             guard let podcast = podcastsBySourceId[source.sourcePodcastId],
                   let destination = matchingEpisode(source, in: episodesByPodcastId[podcast.id] ?? [])
             else {
@@ -209,15 +237,14 @@ enum OvercastMigration {
                 )
                 report.restoredPlaybackStates += 1
             }
-            if source.archived {
-                dataManager.saveEpisode(archived: true, episode: destination, updateSyncFlag: true)
-                report.restoredArchivedStates += 1
+            if source.overcastDeleted {
+                report.ignoredOvercastDeletionMarkers += 1
             }
             if source.starredTime > 0 {
                 dataManager.saveEpisode(starred: true, episode: destination, updateSyncFlag: true)
                 report.restoredStars += 1
             }
-            if source.downloadRequested {
+            if restoreDownloads, source.downloadRequested {
                 downloadManager.addToQueue(episodeUuid: destination.uuid, fireNotification: false, autoDownloadStatus: .notSpecified)
                 report.queuedRedownloads += 1
             }
@@ -225,8 +252,38 @@ enum OvercastMigration {
         return report
     }
 
-    private static func shouldRestore(_ episode: Episode) -> Bool {
-        episode.playbackState != .notStarted || episode.archived || episode.starredTime > 0 || episode.downloadRequested
+    /// Creates a temporary OPML document for the existing, audited OPML
+    /// importer. The caller is responsible for presenting an explicit import
+    /// action; merely writing this file never changes a subscription.
+    static func writeOPML(bundle: Bundle) throws -> URL {
+        let feeds = Array(Set(bundle.subscriptions.compactMap(\.feedURL))).sorted()
+        let outlines = feeds.map { feed in
+            "  <outline type=\"rss\" xmlUrl=\"\(xmlEscaped(feed))\" />"
+        }.joined(separator: "\n")
+        let opml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <opml version="2.0">
+        <body>
+        \(outlines)
+        </body>
+        </opml>
+        """
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("overcast-migration-\(UUID().uuidString).opml")
+        try Data(opml.utf8).write(to: file, options: .atomic)
+        return file
+    }
+
+    private static func xmlEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+    }
+
+    private static func shouldRestore(_ episode: Episode, restoreDownloads: Bool) -> Bool {
+        episode.playbackState != .notStarted || episode.starredTime > 0 || (restoreDownloads && episode.downloadRequested)
     }
 
     private static func matchingEpisode(_ source: Episode, in destination: [PocketCastsDataModel.Episode]) -> PocketCastsDataModel.Episode? {

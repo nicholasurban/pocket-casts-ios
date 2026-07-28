@@ -149,7 +149,7 @@ def extract(connection: sqlite3.Connection, episode_limit: int | None = None) ->
                e.publishedTime AS published_time, e.title, e.linkURL AS link_url,
                e.enclosureURL AS enclosure_url, e.episode, e.season,
                e.advertisedDuration AS advertised_duration,
-               e.userProgress AS progress_seconds, e.userDeleted AS archived,
+               e.userProgress AS progress_seconds, e.userDeleted AS overcast_deleted,
                e.userRecommendedTime AS starred_time, e.userAddedManually AS added_manually,
                e.userLastPlayedTime AS last_played_time, e.downloadState AS download_state,
                e.downloadedExtension AS downloaded_extension,

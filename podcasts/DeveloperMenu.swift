@@ -8,6 +8,8 @@ struct DeveloperMenu: View {
     @State var showingImporter = false
     @State var showingExporter = false
     @State var showingOvercastMigrationImporter = false
+    @State var showingOvercastMigrationSubscriptionImporter = false
+    @State var showingOvercastMigrationStateImporter = false
     @State var overcastMigrationReport: String?
     @State var showingPlaylistsOnboarding = false
     @State var showingRecommendationsOnboarding = false
@@ -79,6 +81,7 @@ struct DeveloperMenu: View {
                             Episode states to restore: \(plan.statefulEpisodes)
                             Download candidates: \(plan.downloadedEpisodes)
                             Podcast feeds to refresh: \(plan.requiredRefreshes)
+                            Overcast removal markers (not applied): \(plan.ignoredOvercastDeletionMarkers)
                             """
                         } catch {
                             overcastMigrationReport = error.localizedDescription
@@ -94,6 +97,65 @@ struct DeveloperMenu: View {
                     Button("OK", role: .cancel) { overcastMigrationReport = nil }
                 } message: {
                     Text(overcastMigrationReport ?? "")
+                }
+                Button("Subscribe from Overcast Migration") {
+                    showingOvercastMigrationSubscriptionImporter.toggle()
+                }
+                .fileImporter(isPresented: $showingOvercastMigrationSubscriptionImporter, allowedContentTypes: [.folder]) { result in
+                    switch result {
+                    case let .success(url):
+                        let hasAccess = url.startAccessingSecurityScopedResource()
+                        defer {
+                            if hasAccess {
+                                url.stopAccessingSecurityScopedResource()
+                            }
+                        }
+                        do {
+                            let bundle = try OvercastMigration.Bundle.load(from: url)
+                            let opml = try OvercastMigration.writeOPML(bundle: bundle)
+                            PodcastManager.shared.importPodcastsFromOpml(opml)
+                            overcastMigrationReport = "Subscription import started for \(bundle.subscriptions.count) feeds. Wait for it to finish, refresh feeds, then use Restore Matched Overcast State."
+                        } catch {
+                            overcastMigrationReport = error.localizedDescription
+                        }
+                    case let .failure(error):
+                        overcastMigrationReport = error.localizedDescription
+                    }
+                }
+                Button("Restore Matched Overcast State") {
+                    showingOvercastMigrationStateImporter.toggle()
+                }
+                .fileImporter(isPresented: $showingOvercastMigrationStateImporter, allowedContentTypes: [.folder]) { result in
+                    switch result {
+                    case let .success(url):
+                        let hasAccess = url.startAccessingSecurityScopedResource()
+                        defer {
+                            if hasAccess {
+                                url.stopAccessingSecurityScopedResource()
+                            }
+                        }
+                        do {
+                            let bundle = try OvercastMigration.Bundle.load(from: url)
+                            let report = OvercastMigration.restoreExistingState(
+                                bundle: bundle,
+                                podcasts: DataManager.sharedManager.allPodcasts(includeUnsubscribed: true)
+                            )
+                            overcastMigrationReport = """
+                            Matched subscriptions: \(report.matchedSubscriptions)
+                            Unresolved subscriptions: \(report.unresolvedSubscriptions)
+                            Matched episodes: \(report.matchedEpisodes)
+                            Unresolved episode records: \(report.unresolvedEpisodes)
+                            Playback states restored: \(report.restoredPlaybackStates)
+                            Stars restored: \(report.restoredStars)
+                            Overcast removal markers ignored: \(report.ignoredOvercastDeletionMarkers)
+                            Downloads queued: \(report.queuedRedownloads)
+                            """
+                        } catch {
+                            overcastMigrationReport = error.localizedDescription
+                        }
+                    case let .failure(error):
+                        overcastMigrationReport = error.localizedDescription
+                    }
                 }
                 Button(action: {
                     PCBundleDoc.delete()
