@@ -2,10 +2,13 @@ import SwiftUI
 import PocketCastsServer
 import PocketCastsDataModel
 import PocketCastsUtils
+import UniformTypeIdentifiers
 
 struct DeveloperMenu: View {
     @State var showingImporter = false
     @State var showingExporter = false
+    @State var showingOvercastMigrationImporter = false
+    @State var overcastMigrationReport: String?
     @State var showingPlaylistsOnboarding = false
     @State var showingRecommendationsOnboarding = false
     @State var showingInterestsOnboarding = false
@@ -50,6 +53,47 @@ struct DeveloperMenu: View {
                     case .failure(let error):
                         print("Failed to export pcasts: \(error)")
                     }
+                }
+                Button("Dry Run Overcast Migration") {
+                    showingOvercastMigrationImporter.toggle()
+                }
+                .fileImporter(isPresented: $showingOvercastMigrationImporter, allowedContentTypes: [.folder]) { result in
+                    switch result {
+                    case let .success(url):
+                        let hasAccess = url.startAccessingSecurityScopedResource()
+                        defer {
+                            if hasAccess {
+                                url.stopAccessingSecurityScopedResource()
+                            }
+                        }
+                        do {
+                            let bundle = try OvercastMigration.Bundle.load(from: url)
+                            let plan = OvercastMigration.dryRun(
+                                bundle: bundle,
+                                podcasts: DataManager.sharedManager.allPodcasts(includeUnsubscribed: true)
+                            )
+                            overcastMigrationReport = """
+                            Source subscriptions: \(plan.sourceSubscriptions)
+                            Already matched: \(plan.matchedSubscriptions)
+                            Still to subscribe: \(plan.unresolvedSubscriptions)
+                            Episode states to restore: \(plan.statefulEpisodes)
+                            Download candidates: \(plan.downloadedEpisodes)
+                            Podcast feeds to refresh: \(plan.requiredRefreshes)
+                            """
+                        } catch {
+                            overcastMigrationReport = error.localizedDescription
+                        }
+                    case let .failure(error):
+                        overcastMigrationReport = error.localizedDescription
+                    }
+                }
+                .alert("Overcast Migration Dry Run", isPresented: Binding(
+                    get: { overcastMigrationReport != nil },
+                    set: { if !$0 { overcastMigrationReport = nil } }
+                )) {
+                    Button("OK", role: .cancel) { overcastMigrationReport = nil }
+                } message: {
+                    Text(overcastMigrationReport ?? "")
                 }
                 Button(action: {
                     PCBundleDoc.delete()

@@ -67,6 +67,52 @@ def inventory_audio(roots: list[Path], output: Path | None, copy_audio: bool) ->
     return inventory
 
 
+def inventory_downloaded_episode_audio(connection: sqlite3.Connection, database: Path, output: Path | None, copy_audio: bool) -> list[dict[str, Any]]:
+    """Inventory only audio files that Overcast names after its episode IDs.
+
+    This avoids treating its SQLite files, artwork, or transient network files
+    as episode audio. A missing file is intentionally reported as unresolved so
+    the Pocket Casts importer can queue a normal re-download instead.
+    """
+    inventory: list[dict[str, Any]] = []
+    files_by_episode_id: dict[int, Path] = {}
+    for file in database.parent.iterdir():
+        if file.suffix.lower() not in {".mp3", ".m4a"}:
+            continue
+        try:
+            files_by_episode_id[int(file.stem)] = file
+        except ValueError:
+            continue
+    candidates = rows(connection, """
+        SELECT id AS source_episode_id, enclosureURL AS enclosure_url,
+               downloadedExtension AS file_extension, downloadState AS download_state
+        FROM OCEpisode
+        WHERE downloadState != 0 OR id IN ({})
+        ORDER BY id
+    """.format(",".join("?" for _ in files_by_episode_id) or "NULL"), tuple(files_by_episode_id))
+    for candidate in candidates:
+        source = files_by_episode_id.get(candidate["source_episode_id"])
+        record = {
+            "source_episode_id": candidate["source_episode_id"],
+            "enclosure_url": candidate["enclosure_url"],
+            "source_download_state": candidate["download_state"],
+            "present": source is not None,
+        }
+        if source is not None:
+            extension = source.suffix.lstrip(".")
+            record["file_extension"] = extension
+            record["bytes"] = source.stat().st_size
+            record["sha256"] = sha256(source)
+            record["relative_path"] = f"audio/{source.name}"
+            if copy_audio:
+                assert output is not None
+                destination = output / "audio" / source.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+        inventory.append(record)
+    return inventory
+
+
 def open_source(path: Path) -> sqlite3.Connection:
     # mode=ro prevents accidental writes while still allowing SQLite to read the
     # current WAL snapshot produced by the live Overcast app.
@@ -134,6 +180,21 @@ def extract(connection: sqlite3.Connection, episode_limit: int | None = None) ->
                userInfo AS user_info, userDeletedLocally AS deleted
         FROM OCPlaybackSession ORDER BY updatedTime, id
     """) if "OCPlaybackSession" in table_names else []
+    current_playback = rows(connection, """
+        SELECT currentlyLoadedEpisodeID AS source_episode_id
+        FROM OCUser
+        LIMIT 1
+    """)
+
+    for episode in episodes:
+        duration = episode["advertised_duration"]
+        progress = episode["progress_seconds"]
+        episode["playback_state"] = (
+            "not_started" if progress == 0
+            else "completed" if duration > 0 and progress >= duration
+            else "in_progress"
+        )
+        episode["download_requested"] = episode["download_state"] != 0
 
     subscriptions = [podcast for podcast in podcasts if podcast["subscribed"]]
     show_settings = [{key: value for key, value in podcast.items() if key not in {
@@ -145,11 +206,15 @@ def extract(connection: sqlite3.Connection, episode_limit: int | None = None) ->
         "playlists": playlists,
         "queues": [playlist for playlist in playlists if playlist["manual_sort"]],
         "show_settings": show_settings,
-        "playback_state": {"sessions": playback_sessions},
+        "playback_state": {
+            "sessions": playback_sessions,
+            "current_source_episode_id": current_playback[0]["source_episode_id"] if current_playback else None,
+        },
         "counts": {
             "podcasts": len(podcasts), "subscriptions": len(subscriptions), "episodes": len(episodes),
             "downloaded_candidates": sum(episode["download_state"] != 0 for episode in episodes),
-            "in_progress": sum(episode["progress_seconds"] > 0 for episode in episodes),
+            "in_progress": sum(episode["playback_state"] == "in_progress" for episode in episodes),
+            "completed": sum(episode["playback_state"] == "completed" for episode in episodes),
             "starred": sum(episode["starred_time"] > 0 for episode in episodes),
             "playlists": len(playlists), "playback_sessions": len(playback_sessions),
         },
@@ -168,6 +233,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Inspect and report counts without writing a bundle")
     parser.add_argument("--audio-root", type=Path, action="append", default=[], help="Directory containing Overcast audio to inventory (repeatable)")
     parser.add_argument("--copy-audio", action="store_true", help="Copy complete files from --audio-root into bundle/audio")
+    parser.add_argument("--include-downloaded-audio", action="store_true", help="Copy verified Overcast episode files named after source episode IDs")
     parser.add_argument("--test-only", action="store_true", help="Allow a deliberately incomplete bundle for exporter verification")
     parser.add_argument("--limit-episodes", type=int, help="Number of episodes in a --test-only bundle")
     args = parser.parse_args()
@@ -179,6 +245,8 @@ def main() -> int:
         parser.error(f"output directory must be empty: {args.output}")
     if args.copy_audio and not args.audio_root:
         parser.error("--copy-audio requires at least one --audio-root")
+    if args.include_downloaded_audio and args.dry_run:
+        parser.error("--include-downloaded-audio requires --output DIRECTORY")
     if args.limit_episodes is not None and (not args.test_only or args.limit_episodes < 0):
         parser.error("--limit-episodes requires --test-only and a non-negative value")
     for audio_root in args.audio_root:
@@ -209,6 +277,10 @@ def main() -> int:
     if args.audio_root:
         audio = inventory_audio(args.audio_root, output=output, copy_audio=args.copy_audio)
         write_json(output, "audio-inventory.json", audio)
+    if args.include_downloaded_audio:
+        with open_source(args.database) as connection:
+            downloaded_audio = inventory_downloaded_episode_audio(connection, args.database, output=output, copy_audio=True)
+        write_json(output, "downloaded-audio-inventory.json", downloaded_audio)
     print(f"Wrote audited migration bundle to {output}")
     return 0
 
