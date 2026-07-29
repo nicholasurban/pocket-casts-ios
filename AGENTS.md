@@ -42,6 +42,30 @@ make test_staging ONLY_TESTING=PocketCastsServerTests
 make test_staging ONLY_TESTING=PocketCastsUtilsTests
 ```
 
+## Phase 0 proof shadow
+
+Select native verification from the change's actual impact under the existing
+repository policy before adding shadow observation:
+
+- Docs-only changes use `git diff --check`; changed JSONL also requires `jq`
+  validation.
+- Overcast migration code or tests use `make format`, then
+  `make test_staging ONLY_TESTING=PocketCastsTests/OvercastMigrationTests`.
+- Overcast migration app wiring additionally uses `make build_staging`.
+- A live-account migration requires approval, a pre-import backup, the native
+  import and sync, and reconciliation proof. Code gates cannot authorize it.
+
+At most once, run an already-required native gate through:
+
+```bash
+outliyr-proof-gate --pilot-auto --change-id <ledger-id> \
+  --gate <stable-native-gate-id> --impact-tag <registered-impact-tag> \
+  -- <exact-native-command>
+```
+
+The telemetry is shadow-only. It must never add, repeat, skip, replace, reorder,
+or authorize gates, and telemetry failure never changes the native result.
+
 ## Architecture
 
 ### Modular Structure
