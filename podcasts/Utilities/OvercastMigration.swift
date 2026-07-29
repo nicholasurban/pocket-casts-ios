@@ -144,11 +144,33 @@ enum OvercastMigration {
         }
     }
 
+    struct Playlist: Decodable {
+        let title: String
+        let preset: Int
+        let includedEpisodeIds: String?
+        let manualSort: String?
+        let individualEpisodesOnly: Bool
+        let deleted: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case title, preset, deleted
+            case includedEpisodeIds = "included_episode_ids"
+            case manualSort = "manual_sort"
+            case individualEpisodesOnly = "individual_episodes_only"
+        }
+
+        var orderedEpisodeIds: [Int64] {
+            let value = (manualSort?.isEmpty == false ? manualSort : includedEpisodeIds) ?? ""
+            return value.split(separator: ",").compactMap { Int64($0) }
+        }
+    }
+
     struct Bundle {
         let manifest: Manifest
         let subscriptions: [Subscription]
         let episodes: [Episode]
         let showSettings: [ShowSetting]
+        let playlists: [Playlist]
 
         static func load(from directory: URL) throws -> Self {
             let manifest: Manifest = try decode("manifest.json", in: directory)
@@ -165,7 +187,8 @@ enum OvercastMigration {
                 manifest: manifest,
                 subscriptions: try decode("subscriptions.json", in: directory),
                 episodes: try decode("episodes.json", in: directory),
-                showSettings: try decode("show_settings.json", in: directory)
+                showSettings: try decode("show_settings.json", in: directory),
+                playlists: try decode("playlists.json", in: directory)
             )
         }
 
@@ -198,6 +221,9 @@ enum OvercastMigration {
         var restoredStars = 0
         var queuedRedownloads = 0
         var restoredShowSettings = 0
+        var restoredQueueEpisodes = 0
+        var restoredPlaylists = 0
+        var unresolvedCollectionEpisodes = 0
     }
 
     static func dryRun(bundle: Bundle, podcasts: [Podcast]) -> DryRun {
@@ -315,6 +341,66 @@ enum OvercastMigration {
                 downloadManager.addToQueue(episodeUuid: destination.uuid, fireNotification: false, autoDownloadStatus: .notSpecified)
                 report.queuedRedownloads += 1
             }
+        }
+        return report
+    }
+
+    static func restoreCollections(
+        bundle: Bundle,
+        podcasts: [Podcast],
+        dataManager: DataManager = .sharedManager,
+        playbackQueue: PlaybackQueue = PlaybackQueue()
+    ) -> Reconciliation {
+        var report = Reconciliation()
+        let destinationByFeed = Dictionary(
+            podcasts.compactMap { podcast in canonicalFeedURL(podcast.podcastUrl).map { ($0, podcast) } },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let sourcePodcastById = Dictionary(uniqueKeysWithValues: bundle.subscriptions.compactMap { subscription in
+            guard let feed = canonicalFeedURL(subscription.feedURL),
+                  let podcast = destinationByFeed[feed]
+            else { return nil }
+            return (subscription.sourcePodcastId, podcast)
+        })
+        var destinationEpisodes = [Int64: [PocketCastsDataModel.Episode]]()
+        for podcast in sourcePodcastById.values {
+            destinationEpisodes[podcast.id] = dataManager.findEpisodesWhere(
+                customWhere: "podcast_id = ?",
+                arguments: [podcast.id]
+            )
+        }
+        let sourceEpisodes = Dictionary(uniqueKeysWithValues: bundle.episodes.map { ($0.sourceEpisodeId, $0) })
+
+        func matched(_ ids: [Int64]) -> [PocketCastsDataModel.Episode] {
+            ids.compactMap { id in
+                guard let source = sourceEpisodes[id],
+                      let podcast = sourcePodcastById[source.sourcePodcastId],
+                      let episode = matchingEpisode(source, in: destinationEpisodes[podcast.id] ?? [])
+                else {
+                    report.unresolvedCollectionEpisodes += 1
+                    return nil
+                }
+                return episode
+            }
+        }
+
+        if let queue = bundle.playlists.first(where: { $0.preset == 8 && !$0.deleted }) {
+            let episodes = matched(queue.orderedEpisodeIds)
+            playbackQueue.bulkAdd(episodes, toTop: false)
+            report.restoredQueueEpisodes = episodes.count
+        }
+
+        let existingNames = Set(dataManager.allPlaylists(includeDeleted: false).map(\.playlistName))
+        for playlist in bundle.playlists
+            where playlist.preset == 0 && playlist.individualEpisodesOnly && !playlist.deleted &&
+            !existingNames.contains(playlist.title) {
+            let episodes = matched(playlist.orderedEpisodeIds)
+            guard !episodes.isEmpty else { continue }
+            report.restoredPlaylists += dataManager.createManualPlaylists(
+                from: episodes,
+                batchSize: 10_000,
+                baseName: playlist.title
+            )
         }
         return report
     }

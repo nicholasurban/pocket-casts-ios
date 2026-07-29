@@ -10,6 +10,7 @@ struct DeveloperMenu: View {
     @State var showingOvercastMigrationImporter = false
     @State var showingOvercastMigrationSubscriptionImporter = false
     @State var showingOvercastMigrationStateImporter = false
+    @State var showingOvercastMigrationCollectionsImporter = false
     @State var overcastMigrationReport: String?
     @State var showingPlaylistsOnboarding = false
     @State var showingRecommendationsOnboarding = false
@@ -150,6 +151,32 @@ struct DeveloperMenu: View {
                             Show settings restored: \(report.restoredShowSettings)
                             Overcast removal markers ignored: \(report.ignoredOvercastDeletionMarkers)
                             Downloads queued: \(report.queuedRedownloads)
+                            """
+                        } catch {
+                            overcastMigrationReport = error.localizedDescription
+                        }
+                    case let .failure(error):
+                        overcastMigrationReport = error.localizedDescription
+                    }
+                }
+                Button("Restore Overcast Queue + Playlists") {
+                    showingOvercastMigrationCollectionsImporter.toggle()
+                }
+                .fileImporter(isPresented: $showingOvercastMigrationCollectionsImporter, allowedContentTypes: [.folder]) { result in
+                    switch result {
+                    case let .success(url):
+                        let hasAccess = url.startAccessingSecurityScopedResource()
+                        defer { if hasAccess { url.stopAccessingSecurityScopedResource() } }
+                        do {
+                            let bundle = try OvercastMigration.Bundle.load(from: url)
+                            let report = OvercastMigration.restoreCollections(
+                                bundle: bundle,
+                                podcasts: DataManager.sharedManager.allPodcasts(includeUnsubscribed: true)
+                            )
+                            overcastMigrationReport = """
+                            Queue episodes restored: \(report.restoredQueueEpisodes)
+                            Manual playlists restored: \(report.restoredPlaylists)
+                            Unresolved collection episodes: \(report.unresolvedCollectionEpisodes)
                             """
                         } catch {
                             overcastMigrationReport = error.localizedDescription
