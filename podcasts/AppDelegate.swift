@@ -27,6 +27,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     lazy var appLifecycleAnalytics = AppLifecycleAnalytics()
 
     private var backgroundSignOutListener: BackgroundSignOutListener?
+    #if DEBUG
+        private var overcastMigrationQARunner: OvercastMigrationRunner?
+    #endif
     private(set) var appInstallState: AppLifecycleAnalytics.AppInstallState?
 
     lazy var whatsNew = WhatsNew()
@@ -130,6 +133,25 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
             ApiServerHandler.shared.retrieveSubscriptionStatus()
             FileLog.shared.addMessage("Reload subscription status early as the app updated")
         }
+
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains(OvercastMigration.fullQALaunchArgument) {
+            let runner = OvercastMigrationRunner()
+            overcastMigrationQARunner = runner
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                runner.runInstalled(mode: .rehearsal)
+            }
+        } else if OvercastMigration.shouldRunInstalledPreflightRehearsal() {
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let receipt = try OvercastMigration.runInstalledPreflightRehearsal()
+                    print("Overcast migration QA passed: \(receipt.path)")
+                } catch {
+                    print("Overcast migration QA failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        #endif
 
         return true
     }

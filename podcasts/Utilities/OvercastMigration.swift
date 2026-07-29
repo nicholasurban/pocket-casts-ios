@@ -1,6 +1,8 @@
+import Combine
 import CryptoKit
 import Foundation
 import PocketCastsDataModel
+import PocketCastsServer
 
 /// The portable format written by `scripts/overcast-migration-export.py`.
 /// Loading and planning are intentionally side-effect-free. Subscription and
@@ -8,6 +10,11 @@ import PocketCastsDataModel
 enum OvercastMigration {
     static let format = "overcast-migration"
     static let supportedFormatVersion = 1
+    static let qaLaunchArgument = "--overcast-migration-qa"
+    static let fullQALaunchArgument = "--overcast-migration-full-qa"
+    static let qaBundleDirectoryName = "OvercastMigrationQA"
+    static let qaMarkerFileName = "OvercastMigrationQA.run"
+    static let qaReceiptFileName = "OvercastMigrationQAReceipt.json"
 
     struct Manifest: Decodable {
         let format: String
@@ -23,6 +30,7 @@ enum OvercastMigration {
     }
 
     struct Counts: Decodable {
+        let podcasts: Int?
         let subscriptions: Int
         let episodes: Int
         let downloadedCandidates: Int
@@ -32,7 +40,7 @@ enum OvercastMigration {
         let playlists: Int
 
         enum CodingKeys: String, CodingKey {
-            case subscriptions, episodes, starred, playlists, completed
+            case podcasts, subscriptions, episodes, starred, playlists, completed
             case downloadedCandidates = "downloaded_candidates"
             case inProgress = "in_progress"
         }
@@ -47,6 +55,34 @@ enum OvercastMigration {
             case title
             case sourcePodcastId = "id"
             case feedURL = "feed_url"
+        }
+    }
+
+    struct SourcePodcast: Decodable {
+        let sourcePodcastId: Int64
+        let feedURL: String?
+        let title: String
+        let subscribed: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case title, subscribed
+            case sourcePodcastId = "id"
+            case feedURL = "feed_url"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            sourcePodcastId = try container.decode(Int64.self, forKey: .sourcePodcastId)
+            feedURL = try container.decodeIfPresent(String.self, forKey: .feedURL)
+            title = try container.decode(String.self, forKey: .title)
+            subscribed = try container.decodeSQLiteBooleanIfPresent(forKey: .subscribed) ?? false
+        }
+
+        init(subscription: Subscription) {
+            sourcePodcastId = subscription.sourcePodcastId
+            feedURL = subscription.feedURL
+            title = subscription.title
+            subscribed = true
         }
     }
 
@@ -202,6 +238,7 @@ enum OvercastMigration {
 
     struct Bundle {
         let manifest: Manifest
+        let sourcePodcasts: [SourcePodcast]
         let subscriptions: [Subscription]
         let episodes: [Episode]
         let showSettings: [ShowSetting]
@@ -209,6 +246,7 @@ enum OvercastMigration {
         let audioRecords: [AudioRecord]
         let directory: URL
         let playbackState: PlaybackState
+        let verifiedArtifactChecksums: Int
 
         static func load(from directory: URL) throws -> Self {
             let manifest: Manifest = try decode("manifest.json", in: directory)
@@ -221,16 +259,47 @@ enum OvercastMigration {
             guard !manifest.testOnly else {
                 throw Error.testOnlyBundle
             }
+            let verifiedArtifactChecksums = try verifyArtifactChecksums(in: directory)
+            let subscriptions: [Subscription] = try decode("subscriptions.json", in: directory)
+            let sourcePodcasts: [SourcePodcast] =
+                try decodeIfPresent("podcasts.json", in: directory)
+                ?? subscriptions.map(SourcePodcast.init(subscription:))
             return Self(
                 manifest: manifest,
-                subscriptions: try decode("subscriptions.json", in: directory),
+                sourcePodcasts: sourcePodcasts,
+                subscriptions: subscriptions,
                 episodes: try decode("episodes.json", in: directory),
                 showSettings: try decode("show_settings.json", in: directory),
                 playlists: try decode("playlists.json", in: directory),
                 audioRecords: try decode("downloaded-audio-inventory.json", in: directory),
                 directory: directory,
-                playbackState: try decode("playback_state.json", in: directory)
+                playbackState: try decode("playback_state.json", in: directory),
+                verifiedArtifactChecksums: verifiedArtifactChecksums
             )
+        }
+
+        private static func verifyArtifactChecksums(in directory: URL) throws -> Int {
+            let checksumFile = directory.appendingPathComponent("artifact-checksums.json")
+            guard FileManager.default.fileExists(atPath: checksumFile.path) else {
+                return 0 // Compatibility with bundles made before checksums were added.
+            }
+            let checksums = try JSONDecoder().decode(
+                [String: String].self,
+                from: Data(contentsOf: checksumFile)
+            )
+            for (name, expected) in checksums {
+                guard !name.isEmpty, name == URL(fileURLWithPath: name).lastPathComponent else {
+                    throw Error.invalidArtifactName(name)
+                }
+                let file = directory.appendingPathComponent(name)
+                guard FileManager.default.fileExists(atPath: file.path) else {
+                    throw Error.missingArtifact(name)
+                }
+                guard OvercastMigration.fileSHA256(file) == expected else {
+                    throw Error.artifactChecksumMismatch(name)
+                }
+            }
+            return checksums.count
         }
 
         private static func decode<T: Decodable>(_ name: String, in directory: URL) throws -> T {
@@ -238,6 +307,15 @@ enum OvercastMigration {
             guard FileManager.default.fileExists(atPath: file.path) else {
                 throw Error.missingArtifact(name)
             }
+            return try JSONDecoder().decode(T.self, from: Data(contentsOf: file))
+        }
+
+        private static func decodeIfPresent<T: Decodable>(
+            _ name: String,
+            in directory: URL
+        ) throws -> T? {
+            let file = directory.appendingPathComponent(name, isDirectory: false)
+            guard FileManager.default.fileExists(atPath: file.path) else { return nil }
             return try JSONDecoder().decode(T.self, from: Data(contentsOf: file))
         }
     }
@@ -252,22 +330,139 @@ enum OvercastMigration {
         let ignoredOvercastDeletionMarkers: Int
     }
 
+    private struct PodcastReconciliation {
+        let podcastsBySourceId: [Int64: Podcast]
+        let episodesByPodcastId: [Int64: [PocketCastsDataModel.Episode]]
+    }
+
+    /// Pocket Casts' `podcastUrl` is the show's website, not its RSS feed.
+    /// Reconcile an imported show first by exact episode enclosure overlap,
+    /// then by a unique title. A feed/website equality is retained only as an
+    /// additional exact signal for private feeds that expose it there.
+    private static func reconcilePodcasts(
+        bundle: Bundle,
+        podcasts: [Podcast],
+        dataManager: DataManager
+    ) -> PodcastReconciliation {
+        var episodesByPodcastId = [Int64: [PocketCastsDataModel.Episode]]()
+        var destinationIdsByEnclosure = [String: Set<Int64>]()
+        for podcast in podcasts {
+            let episodes = dataManager.findEpisodesWhere(
+                customWhere: "podcast_id = ?",
+                arguments: [podcast.id]
+            )
+            episodesByPodcastId[podcast.id] = episodes
+            for enclosure in episodes.compactMap(\.downloadUrl) where !enclosure.isEmpty {
+                destinationIdsByEnclosure[enclosure, default: []].insert(podcast.id)
+            }
+        }
+
+        let podcastsById = Dictionary(
+            podcasts.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let podcastsByURL = Dictionary(
+            podcasts.compactMap { podcast in
+                canonicalFeedURL(podcast.podcastUrl).map { ($0, [podcast]) }
+            },
+            uniquingKeysWith: +
+        )
+        let podcastsByTitle = Dictionary(
+            podcasts.map { (normalizedTitle($0.title), [$0]) },
+            uniquingKeysWith: +
+        )
+        let sourceEpisodes = Dictionary(
+            grouping: bundle.episodes,
+            by: \.sourcePodcastId
+        )
+
+        var result = [Int64: Podcast]()
+        var claimedDestinationIds = Set<Int64>()
+        for sourcePodcast in sourcePodcastsForImport(bundle) {
+            var overlapCounts = [Int64: Int]()
+            for episode in sourceEpisodes[sourcePodcast.sourcePodcastId] ?? [] {
+                for destinationId in destinationIdsByEnclosure[episode.enclosureURL] ?? [] {
+                    overlapCounts[destinationId, default: 0] += 1
+                }
+            }
+            let highestOverlap = overlapCounts.values.max() ?? 0
+            let overlapCandidates = overlapCounts
+                .filter { $0.value == highestOverlap && highestOverlap > 0 }
+                .compactMap { podcastsById[$0.key] }
+
+            let feedCandidates = canonicalFeedURL(sourcePodcast.feedURL)
+                .flatMap { podcastsByURL[$0] } ?? []
+            let titleCandidates = podcastsByTitle[normalizedTitle(sourcePodcast.title)] ?? []
+            let candidates = overlapCandidates.count == 1
+                ? overlapCandidates
+                : (feedCandidates.count == 1 ? feedCandidates : titleCandidates)
+
+            guard candidates.count == 1,
+                  let podcast = candidates.first,
+                  !claimedDestinationIds.contains(podcast.id)
+            else { continue }
+            result[sourcePodcast.sourcePodcastId] = podcast
+            claimedDestinationIds.insert(podcast.id)
+        }
+        return PodcastReconciliation(
+            podcastsBySourceId: result,
+            episodesByPodcastId: episodesByPodcastId
+        )
+    }
+
+    private static func normalizedTitle(_ value: String?) -> String {
+        value?
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    static func sourcePodcastsForImport(_ bundle: Bundle) -> [SourcePodcast] {
+        var requiredIds = Set(
+            bundle.sourcePodcasts.filter(\.subscribed).map(\.sourcePodcastId)
+        )
+        requiredIds.formUnion(bundle.episodes.lazy.filter {
+            shouldRestore($0, restoreDownloads: true)
+        }.map(\.sourcePodcastId))
+        let episodeById = Dictionary(
+            uniqueKeysWithValues: bundle.episodes.map { ($0.sourceEpisodeId, $0) }
+        )
+        for playlist in bundle.playlists where !playlist.deleted {
+            requiredIds.formUnion(
+                playlist.orderedEpisodeIds.compactMap { episodeById[$0]?.sourcePodcastId }
+            )
+        }
+        if let currentId = bundle.playbackState.currentSourceEpisodeId,
+           let current = bundle.episodes.first(where: { $0.sourceEpisodeId == currentId }) {
+            requiredIds.insert(current.sourcePodcastId)
+        }
+        return bundle.sourcePodcasts.filter {
+            requiredIds.contains($0.sourcePodcastId)
+        }
+    }
+
+    static func importFeedURLs(_ bundle: Bundle) -> [String] {
+        Array(Set(sourcePodcastsForImport(bundle).compactMap(\.feedURL))).sorted()
+    }
+
     /// Writes a durable, human-readable preflight report without changing
     /// either app. Exact episode reconciliation remains a post-refresh step,
     /// so this report clearly separates known matches from work that cannot be
     /// verified until Pocket Casts has refreshed the imported feeds.
     static func writePreflightReport(bundle: Bundle, podcasts: [Podcast]) throws -> URL {
-        let destinationFeeds = Set(podcasts.compactMap { canonicalFeedURL($0.podcastUrl) })
+        let reconciliation = reconcilePodcasts(
+            bundle: bundle,
+            podcasts: podcasts,
+            dataManager: .sharedManager
+        )
         let sourceSubscriptions = bundle.subscriptions.sorted {
             $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
         }
         let unresolved = sourceSubscriptions.filter {
-            guard let feed = canonicalFeedURL($0.feedURL) else { return true }
-            return !destinationFeeds.contains(feed)
+            reconciliation.podcastsBySourceId[$0.sourcePodcastId] == nil
         }
         let missingFeed = sourceSubscriptions.filter { canonicalFeedURL($0.feedURL) == nil }
-        let manualPlaylists = bundle.playlists.filter {
-            $0.preset == 0 && $0.individualEpisodesOnly && !$0.deleted
+        let playlistSnapshots = bundle.playlists.filter {
+            $0.preset == 0 && !$0.deleted && !$0.orderedEpisodeIds.isEmpty
         }
         let queueEpisodes = bundle.playlists.first {
             $0.preset == 8 && !$0.deleted
@@ -306,13 +501,15 @@ enum OvercastMigration {
 
         Source inventory
         - Subscriptions: \(bundle.subscriptions.count)
+        - Library shows needed for state restoration: \(sourcePodcastsForImport(bundle).count)
+        - Feeds to import temporarily: \(importFeedURLs(bundle).count)
         - Episodes: \(bundle.episodes.count)
         - Stateful episodes: \(plan.statefulEpisodes)
         - Download candidates: \(plan.downloadedEpisodes)
         - Preserved audio files: \(presentAudio.count)
         - Missing source audio files: \(missingAudio.count)
         - Queue episodes: \(queueEpisodes)
-        - Manual playlists eligible for restoration: \(manualPlaylists.count)
+        - Custom playlist snapshots eligible for restoration: \(playlistSnapshots.count)
 
         Subscription reconciliation before import
         - Already present in Pocket Casts by canonical feed URL: \(plan.matchedSubscriptions)
@@ -330,6 +527,7 @@ enum OvercastMigration {
         - Preserved audio is imported only after its SHA-256 hash matches the bundle inventory.
         - Episode state is applied only after an existing Pocket Casts episode matches by enclosure URL, or by audited title/date or title/duration fallback.
         - Exact unresolved episode counts are available only after subscriptions import and feed refresh.
+        - Custom playlist membership is restored as a manual snapshot; Overcast-only smart rules cannot remain dynamic.
 
         Overcast smart playlists preserved but not automatically translated
         \(untranslatedLines)
@@ -339,6 +537,112 @@ enum OvercastMigration {
             .appendingPathComponent("overcast-migration-preflight-\(UUID().uuidString).txt")
         try Data(report.utf8).write(to: file, options: .atomic)
         return file
+    }
+
+    struct QAReceipt: Encodable {
+        let passed: Bool
+        let format: String
+        let formatVersion: Int
+        let subscriptions: Int
+        let episodes: Int
+        let unresolvedSubscriptions: Int
+        let ignoredOvercastDeletionMarkers: Int
+        let audioInventoryRecords: Int
+        let generatedOPMLFeeds: Int
+        let reportBytes: Int
+        let verifiedArtifactChecksums: Int
+
+        enum CodingKeys: String, CodingKey {
+            case passed, format, subscriptions, episodes
+            case formatVersion = "format_version"
+            case unresolvedSubscriptions = "unresolved_subscriptions"
+            case ignoredOvercastDeletionMarkers = "ignored_overcast_deletion_markers"
+            case audioInventoryRecords = "audio_inventory_records"
+            case generatedOPMLFeeds = "generated_opml_feeds"
+            case reportBytes = "report_bytes"
+            case verifiedArtifactChecksums = "verified_artifact_checksums"
+        }
+    }
+
+    /// Runs the real preflight path in a disposable Debug app sandbox. This
+    /// never invokes subscription import or any restoration method.
+    static func shouldRunInstalledPreflightRehearsal() -> Bool {
+        if ProcessInfo.processInfo.arguments.contains(qaLaunchArgument) {
+            return true
+        }
+
+        guard let documents = try? documentsDirectory() else { return false }
+        return FileManager.default.fileExists(
+            atPath: documents.appendingPathComponent(qaMarkerFileName).path
+        )
+    }
+
+    static func installedBundleURL() throws -> URL {
+        try documentsDirectory().appendingPathComponent(
+            qaBundleDirectoryName,
+            isDirectory: true
+        )
+    }
+
+    @discardableResult
+    static func runInstalledPreflightRehearsal() throws -> URL {
+        let documents = try documentsDirectory()
+        let bundle = try Bundle.load(
+            from: documents.appendingPathComponent(qaBundleDirectoryName, isDirectory: true)
+        )
+        let plan = dryRun(bundle: bundle, podcasts: [])
+        let reportURL = try writePreflightReport(bundle: bundle, podcasts: [])
+        defer { try? FileManager.default.removeItem(at: reportURL) }
+        let report = try Data(contentsOf: reportURL)
+        guard String(decoding: report, as: UTF8.self)
+            .contains("raw Overcast removal markers will NOT be mapped")
+        else {
+            throw Error.invalidQAOutput("Preflight report is missing the deletion-marker safety decision.")
+        }
+
+        let opmlURL = try writeOPML(bundle: bundle)
+        defer { try? FileManager.default.removeItem(at: opmlURL) }
+        let opml = try String(contentsOf: opmlURL)
+        let generatedFeeds = opml.components(separatedBy: "xmlUrl=").count - 1
+        let expectedFeeds = importFeedURLs(bundle).count
+        guard generatedFeeds == expectedFeeds else {
+            throw Error.invalidQAOutput(
+                "OPML contains \(generatedFeeds) feeds; expected \(expectedFeeds)."
+            )
+        }
+
+        let receipt = QAReceipt(
+            passed: true,
+            format: bundle.manifest.format,
+            formatVersion: bundle.manifest.formatVersion,
+            subscriptions: bundle.subscriptions.count,
+            episodes: bundle.episodes.count,
+            unresolvedSubscriptions: plan.unresolvedSubscriptions,
+            ignoredOvercastDeletionMarkers: plan.ignoredOvercastDeletionMarkers,
+            audioInventoryRecords: bundle.audioRecords.count,
+            generatedOPMLFeeds: generatedFeeds,
+            reportBytes: report.count,
+            verifiedArtifactChecksums: bundle.verifiedArtifactChecksums
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let receiptURL = documents.appendingPathComponent(qaReceiptFileName)
+        try encoder.encode(receipt).write(to: receiptURL, options: .atomic)
+        try report.write(
+            to: documents.appendingPathComponent("OvercastMigrationQAPreflight.txt"),
+            options: .atomic
+        )
+        return receiptURL
+    }
+
+    private static func documentsDirectory() throws -> URL {
+        guard let directory = FileManager.default.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        ).first else {
+            throw Error.invalidQAOutput("The app Documents directory is unavailable.")
+        }
+        return directory
     }
 
     struct Reconciliation {
@@ -351,6 +655,7 @@ enum OvercastMigration {
         var restoredStars = 0
         var queuedRedownloads = 0
         var restoredShowSettings = 0
+        var restoredUnsubscribedLibraryShows = 0
         var restoredQueueEpisodes = 0
         var restoredPlaylists = 0
         var unresolvedCollectionEpisodes = 0
@@ -358,12 +663,66 @@ enum OvercastMigration {
         var unresolvedAudioFiles = 0
         var restoredHistoryDates = 0
         var restoredCurrentEpisode = false
+        var unresolvedRecords = [UnresolvedRecord]()
+
+        mutating func merge(_ other: Self) {
+            matchedSubscriptions += other.matchedSubscriptions
+            unresolvedSubscriptions += other.unresolvedSubscriptions
+            matchedEpisodes += other.matchedEpisodes
+            unresolvedEpisodes += other.unresolvedEpisodes
+            restoredPlaybackStates += other.restoredPlaybackStates
+            ignoredOvercastDeletionMarkers += other.ignoredOvercastDeletionMarkers
+            restoredStars += other.restoredStars
+            queuedRedownloads += other.queuedRedownloads
+            restoredShowSettings += other.restoredShowSettings
+            restoredUnsubscribedLibraryShows += other.restoredUnsubscribedLibraryShows
+            restoredQueueEpisodes += other.restoredQueueEpisodes
+            restoredPlaylists += other.restoredPlaylists
+            unresolvedCollectionEpisodes += other.unresolvedCollectionEpisodes
+            importedAudioFiles += other.importedAudioFiles
+            unresolvedAudioFiles += other.unresolvedAudioFiles
+            restoredHistoryDates += other.restoredHistoryDates
+            restoredCurrentEpisode = restoredCurrentEpisode || other.restoredCurrentEpisode
+            unresolvedRecords += other.unresolvedRecords
+        }
+    }
+
+    struct UnresolvedRecord {
+        let stage: String
+        let sourceEpisodeId: Int64
+        let podcastTitle: String
+        let episodeTitle: String
+        let publishedTime: Int64
+        let enclosureURL: String
+        let reason: String
+    }
+
+    struct DestinationAudit {
+        var matchedLibraryShows = 0
+        var matchedSubscriptions = 0
+        var unresolvedSubscriptions = 0
+        var matchedStatefulEpisodes = 0
+        var verifiedPlaybackStates = 0
+        var verifiedStars = 0
+        var verifiedHistoryDates = 0
+        var verifiedShowSettings = 0
+        var verifiedUnsubscribedLibraryShows = 0
+        var expectedQueueEpisodes = 0
+        var actualQueueEpisodes = 0
+        var queueOrderMatches = false
+        var verifiedPlaylistSnapshots = 0
+        var verifiedAudioFiles = 0
     }
 
     static func dryRun(bundle: Bundle, podcasts: [Podcast]) -> DryRun {
-        let destinationFeeds = Set(podcasts.compactMap { canonicalFeedURL($0.podcastUrl) })
-        let sourceFeeds = bundle.subscriptions.compactMap { canonicalFeedURL($0.feedURL) }
-        let matched = sourceFeeds.filter(destinationFeeds.contains).count
+        let podcastsBySourceId = reconcilePodcasts(
+            bundle: bundle,
+            podcasts: podcasts,
+            dataManager: .sharedManager
+        ).podcastsBySourceId
+        let matched = bundle.subscriptions.filter {
+            podcastsBySourceId[$0.sourcePodcastId] != nil
+        }.count
         let statefulEpisodes = bundle.episodes.filter {
             $0.playbackState != .notStarted || $0.starredTime > 0
         }.count
@@ -373,7 +732,7 @@ enum OvercastMigration {
             unresolvedSubscriptions: bundle.subscriptions.count - matched,
             statefulEpisodes: statefulEpisodes,
             downloadedEpisodes: bundle.episodes.filter(\.downloadRequested).count,
-            requiredRefreshes: Set(bundle.episodes.map(\.sourcePodcastId)).count,
+            requiredRefreshes: sourcePodcastsForImport(bundle).count,
             ignoredOvercastDeletionMarkers: bundle.episodes.filter(\.overcastDeleted).count
         )
     }
@@ -389,21 +748,17 @@ enum OvercastMigration {
         restoreDownloads: Bool = false
     ) -> Reconciliation {
         var report = Reconciliation()
-        let destinationByFeed = Dictionary(
-            podcasts.compactMap { podcast in canonicalFeedURL(podcast.podcastUrl).map { ($0, podcast) } },
-            uniquingKeysWith: { first, _ in first }
+        let reconciliation = reconcilePodcasts(
+            bundle: bundle,
+            podcasts: podcasts,
+            dataManager: dataManager
         )
-        var podcastsBySourceId = [Int64: Podcast]()
+        let podcastsBySourceId = reconciliation.podcastsBySourceId
         for subscription in bundle.subscriptions {
-            guard let feed = canonicalFeedURL(subscription.feedURL) else {
+            guard podcastsBySourceId[subscription.sourcePodcastId] != nil else {
                 report.unresolvedSubscriptions += 1
                 continue
             }
-            guard let podcast = destinationByFeed[feed] else {
-                report.unresolvedSubscriptions += 1
-                continue
-            }
-            podcastsBySourceId[subscription.sourcePodcastId] = podcast
             report.matchedSubscriptions += 1
         }
 
@@ -438,19 +793,22 @@ enum OvercastMigration {
             }
         }
 
-        var episodesByPodcastId = [Int64: [PocketCastsDataModel.Episode]]()
-        for podcast in Set(podcastsBySourceId.values) {
-            episodesByPodcastId[podcast.id] = dataManager.findEpisodesWhere(
-                customWhere: "podcast_id = ?",
-                arguments: [podcast.id]
-            )
-        }
+        let episodesByPodcastId = reconciliation.episodesByPodcastId
 
         for source in bundle.episodes where shouldRestore(source, restoreDownloads: restoreDownloads) {
-            guard let podcast = podcastsBySourceId[source.sourcePodcastId],
-                  let destination = matchingEpisode(source, in: episodesByPodcastId[podcast.id] ?? [])
-            else {
+            guard let podcast = podcastsBySourceId[source.sourcePodcastId] else {
                 report.unresolvedEpisodes += 1
+                report.unresolvedRecords.append(
+                    unresolvedRecord(source, stage: "episode state", reason: "subscription feed was not matched")
+                )
+                continue
+            }
+            let match = episodeMatch(source, in: episodesByPodcastId[podcast.id] ?? [])
+            guard let destination = match.episode else {
+                report.unresolvedEpisodes += 1
+                report.unresolvedRecords.append(
+                    unresolvedRecord(source, stage: "episode state", reason: match.failureReason)
+                )
                 continue
             }
             report.matchedEpisodes += 1
@@ -497,44 +855,62 @@ enum OvercastMigration {
         bundle: Bundle,
         podcasts: [Podcast],
         dataManager: DataManager = .sharedManager,
-        downloadManager: DownloadManager = .shared
+        downloadManager: DownloadManager = .shared,
+        limit: Int? = nil
     ) -> Reconciliation {
         var report = Reconciliation()
-        let destinationByFeed = Dictionary(
-            podcasts.compactMap { podcast in canonicalFeedURL(podcast.podcastUrl).map { ($0, podcast) } },
-            uniquingKeysWith: { first, _ in first }
+        let reconciliation = reconcilePodcasts(
+            bundle: bundle,
+            podcasts: podcasts,
+            dataManager: dataManager
         )
-        let sourcePodcastById: [Int64: Podcast] = Dictionary(
-            bundle.subscriptions.compactMap { subscription -> (Int64, Podcast)? in
-                guard let feed = canonicalFeedURL(subscription.feedURL),
-                      let podcast = destinationByFeed[feed]
-                else { return nil }
-                return (subscription.sourcePodcastId, podcast)
-            },
-            uniquingKeysWith: { first, _ in first }
-        )
-        var destinationEpisodes = [Int64: [PocketCastsDataModel.Episode]]()
-        for podcast in sourcePodcastById.values {
-            destinationEpisodes[podcast.id] = dataManager.findEpisodesWhere(
-                customWhere: "podcast_id = ?",
-                arguments: [podcast.id]
-            )
-        }
+        let sourcePodcastById = reconciliation.podcastsBySourceId
+        let destinationEpisodes = reconciliation.episodesByPodcastId
         let sourceEpisodes = Dictionary(uniqueKeysWithValues: bundle.episodes.map { ($0.sourceEpisodeId, $0) })
 
-        for audio in bundle.audioRecords where audio.present {
+        let presentAudio = bundle.audioRecords.filter(\.present)
+        let candidates = limit == nil ? presentAudio : presentAudio.filter {
+            guard let relativePath = $0.relativePath,
+                  let file = preservedAudioURL(relativePath, in: bundle.directory)
+            else { return false }
+            return FileManager.default.fileExists(atPath: file.path)
+        }
+        for audio in limit.map({ Array(candidates.prefix($0)) }) ?? candidates {
             guard let relativePath = audio.relativePath,
                   let expectedHash = audio.sha256,
                   let source = sourceEpisodes[audio.sourceEpisodeId],
-                  let podcast = sourcePodcastById[source.sourcePodcastId],
-                  let destination = matchingEpisode(source, in: destinationEpisodes[podcast.id] ?? [])
+                  let podcast = sourcePodcastById[source.sourcePodcastId]
             else {
                 report.unresolvedAudioFiles += 1
                 continue
             }
-            let sourceFile = bundle.directory.appendingPathComponent(relativePath)
+            let match = episodeMatch(source, in: destinationEpisodes[podcast.id] ?? [])
+            guard let destination = match.episode else {
+                report.unresolvedAudioFiles += 1
+                report.unresolvedRecords.append(
+                    unresolvedRecord(source, stage: "preserved audio", reason: match.failureReason)
+                )
+                continue
+            }
+            guard let sourceFile = preservedAudioURL(
+                relativePath,
+                in: bundle.directory
+            ) else {
+                report.unresolvedAudioFiles += 1
+                report.unresolvedRecords.append(
+                    unresolvedRecord(
+                        source,
+                        stage: "preserved audio",
+                        reason: "inventory path is outside the bundle audio directory"
+                    )
+                )
+                continue
+            }
             guard fileSHA256(sourceFile) == expectedHash else {
                 report.unresolvedAudioFiles += 1
+                report.unresolvedRecords.append(
+                    unresolvedRecord(source, stage: "preserved audio", reason: "source file is missing or failed SHA-256")
+                )
                 continue
             }
             downloadManager.processEpisode(destination, downloadedFile: sourceFile, reportedContentType: nil, copyFile: true)
@@ -557,6 +933,25 @@ enum OvercastMigration {
         return digest.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
+    private static func preservedAudioURL(
+        _ relativePath: String,
+        in directory: URL
+    ) -> URL? {
+        guard !relativePath.isEmpty, !relativePath.hasPrefix("/") else {
+            return nil
+        }
+        let audioDirectory = directory.appendingPathComponent(
+            "audio",
+            isDirectory: true
+        ).standardizedFileURL
+        let candidate = directory.appendingPathComponent(relativePath)
+            .standardizedFileURL
+        guard candidate.path.hasPrefix(audioDirectory.path + "/") else {
+            return nil
+        }
+        return candidate
+    }
+
     static func restoreCollections(
         bundle: Bundle,
         podcasts: [Podcast],
@@ -564,35 +959,29 @@ enum OvercastMigration {
         playbackQueue: PlaybackQueue = PlaybackQueue()
     ) -> Reconciliation {
         var report = Reconciliation()
-        let destinationByFeed = Dictionary(
-            podcasts.compactMap { podcast in canonicalFeedURL(podcast.podcastUrl).map { ($0, podcast) } },
-            uniquingKeysWith: { first, _ in first }
+        let reconciliation = reconcilePodcasts(
+            bundle: bundle,
+            podcasts: podcasts,
+            dataManager: dataManager
         )
-        let sourcePodcastById: [Int64: Podcast] = Dictionary(
-            bundle.subscriptions.compactMap { subscription -> (Int64, Podcast)? in
-                guard let feed = canonicalFeedURL(subscription.feedURL),
-                      let podcast = destinationByFeed[feed]
-                else { return nil }
-                return (subscription.sourcePodcastId, podcast)
-            },
-            uniquingKeysWith: { first, _ in first }
-        )
-        var destinationEpisodes = [Int64: [PocketCastsDataModel.Episode]]()
-        for podcast in sourcePodcastById.values {
-            destinationEpisodes[podcast.id] = dataManager.findEpisodesWhere(
-                customWhere: "podcast_id = ?",
-                arguments: [podcast.id]
-            )
-        }
+        let sourcePodcastById = reconciliation.podcastsBySourceId
+        let destinationEpisodes = reconciliation.episodesByPodcastId
         let sourceEpisodes = Dictionary(uniqueKeysWithValues: bundle.episodes.map { ($0.sourceEpisodeId, $0) })
 
         func matched(_ ids: [Int64]) -> [PocketCastsDataModel.Episode] {
             ids.compactMap { id in
                 guard let source = sourceEpisodes[id],
-                      let podcast = sourcePodcastById[source.sourcePodcastId],
-                      let episode = matchingEpisode(source, in: destinationEpisodes[podcast.id] ?? [])
+                      let podcast = sourcePodcastById[source.sourcePodcastId]
                 else {
                     report.unresolvedCollectionEpisodes += 1
+                    return nil
+                }
+                let match = episodeMatch(source, in: destinationEpisodes[podcast.id] ?? [])
+                guard let episode = match.episode else {
+                    report.unresolvedCollectionEpisodes += 1
+                    report.unresolvedRecords.append(
+                        unresolvedRecord(source, stage: "queue or playlist", reason: match.failureReason)
+                    )
                     return nil
                 }
                 return episode
@@ -601,30 +990,322 @@ enum OvercastMigration {
 
         if let queue = bundle.playlists.first(where: { $0.preset == 8 && !$0.deleted }) {
             let episodes = matched(queue.orderedEpisodeIds)
-            playbackQueue.bulkAdd(episodes, toTop: false)
+            if !episodes.isEmpty || queue.orderedEpisodeIds.isEmpty {
+                playbackQueue.removeAllEpisodes()
+            }
+            if !episodes.isEmpty {
+                playbackQueue.bulkAdd(episodes, toTop: false)
+            }
             report.restoredQueueEpisodes = episodes.count
         }
 
         let existingNames = Set(dataManager.allPlaylists(includeDeleted: false).map(\.playlistName))
         for playlist in bundle.playlists
-            where playlist.preset == 0 && playlist.individualEpisodesOnly && !playlist.deleted &&
+            where playlist.preset == 0 && !playlist.deleted && !playlist.orderedEpisodeIds.isEmpty &&
             !existingNames.contains(playlist.title) {
             let episodes = matched(playlist.orderedEpisodeIds)
             guard !episodes.isEmpty else { continue }
             report.restoredPlaylists += dataManager.createManualPlaylists(
                 from: episodes,
-                batchSize: 10_000,
+                batchSize: Constants.Limits.maxFilterItems,
                 baseName: playlist.title
             )
         }
         return report
     }
 
+    /// OPML temporarily subscribes to old shows whose episodes are needed for
+    /// history, stars, queues, playlists, or preserved audio. Restore the
+    /// source subscription boundary after all episode work is complete while
+    /// retaining Pocket Casts' native show and episode rows.
+    static func restoreSubscriptionMembership(
+        bundle: Bundle,
+        podcasts: [Podcast],
+        dataManager: DataManager = .sharedManager
+    ) -> Reconciliation {
+        var report = Reconciliation()
+        let reconciliation = reconcilePodcasts(
+            bundle: bundle,
+            podcasts: podcasts,
+            dataManager: dataManager
+        )
+        for source in sourcePodcastsForImport(bundle) where !source.subscribed {
+            guard let podcast = reconciliation.podcastsBySourceId[source.sourcePodcastId]
+            else { continue }
+            if podcast.isSubscribed() {
+                podcast.subscribed = 0
+                podcast.syncStatus = SyncStatus.notSynced.rawValue
+                dataManager.save(podcast: podcast)
+            }
+            report.restoredUnsubscribedLibraryShows += 1
+        }
+        return report
+    }
+
+    /// Reads the destination back after Pocket Casts' final refresh/sync.
+    /// This is deliberately separate from the write counters so a successful
+    /// API call cannot be mistaken for durable destination proof.
+    static func auditDestination(
+        bundle: Bundle,
+        podcasts: [Podcast],
+        dataManager: DataManager = .sharedManager,
+        downloadManager: DownloadManager = .shared,
+        audioLimit: Int? = nil
+    ) -> DestinationAudit {
+        var audit = DestinationAudit()
+        let reconciliation = reconcilePodcasts(
+            bundle: bundle,
+            podcasts: podcasts,
+            dataManager: dataManager
+        )
+        let podcastsBySourceId = reconciliation.podcastsBySourceId
+        let episodesByPodcastId = reconciliation.episodesByPodcastId
+        audit.matchedLibraryShows = podcastsBySourceId.count
+        audit.matchedSubscriptions = bundle.subscriptions.filter {
+            podcastsBySourceId[$0.sourcePodcastId] != nil
+        }.count
+        audit.unresolvedSubscriptions = bundle.subscriptions.count - audit.matchedSubscriptions
+        audit.verifiedUnsubscribedLibraryShows = sourcePodcastsForImport(bundle).filter {
+            !$0.subscribed &&
+                podcastsBySourceId[$0.sourcePodcastId]?.isSubscribed() == false
+        }.count
+
+        for source in bundle.episodes where shouldRestore(source, restoreDownloads: false) {
+            guard let podcast = podcastsBySourceId[source.sourcePodcastId],
+                  let destination = matchingEpisode(
+                      source,
+                      in: episodesByPodcastId[podcast.id] ?? []
+                  )
+            else { continue }
+            audit.matchedStatefulEpisodes += 1
+            switch source.playbackState {
+            case .notStarted:
+                break
+            case .inProgress:
+                if destination.playingStatus == PlayingStatus.inProgress.rawValue,
+                   abs(destination.playedUpTo - Double(source.progressSeconds)) <= 1 {
+                    audit.verifiedPlaybackStates += 1
+                }
+            case .completed:
+                if destination.playingStatus == PlayingStatus.completed.rawValue {
+                    audit.verifiedPlaybackStates += 1
+                }
+            }
+            if source.starredTime > 0, destination.keepEpisode {
+                audit.verifiedStars += 1
+            }
+            if source.lastPlayedTime > 0,
+               let date = destination.lastPlaybackInteractionDate,
+               abs(date.timeIntervalSince1970 - Double(source.lastPlayedTime)) <= 1 {
+                audit.verifiedHistoryDates += 1
+            }
+        }
+
+        for setting in bundle.showSettings {
+            guard let podcast = podcastsBySourceId[setting.sourcePodcastId] else { continue }
+            var verified = true
+            if let speed = setting.playbackSpeed {
+                verified = verified && abs(podcast.playbackSpeed - speed) < 0.001
+            }
+            let skips = setting.skipTimes
+            if skips.intro > 0 {
+                verified = verified && podcast.startFrom == Int32(clamping: skips.intro)
+            }
+            if skips.outro > 0 {
+                verified = verified && podcast.skipLast == Int32(clamping: skips.outro)
+            }
+            if setting.downloadPolicy != 0 {
+                verified = verified &&
+                    podcast.autoDownloadSetting == AutoDownloadSetting.latest.rawValue
+            }
+            if setting.itemLimit > 0 {
+                verified = verified &&
+                    podcast.autoArchiveEpisodeLimit == Int32(clamping: setting.itemLimit)
+            }
+            if verified {
+                audit.verifiedShowSettings += 1
+            }
+        }
+
+        let sourceEpisodes = Dictionary(
+            uniqueKeysWithValues: bundle.episodes.map { ($0.sourceEpisodeId, $0) }
+        )
+        func matchedUUIDs(_ ids: [Int64]) -> [String] {
+            ids.compactMap { id in
+                guard let source = sourceEpisodes[id],
+                      let podcast = podcastsBySourceId[source.sourcePodcastId]
+                else { return nil }
+                return matchingEpisode(
+                    source,
+                    in: episodesByPodcastId[podcast.id] ?? []
+                )?.uuid
+            }
+        }
+        if let queue = bundle.playlists.first(where: { $0.preset == 8 && !$0.deleted }) {
+            let expected = matchedUUIDs(queue.orderedEpisodeIds)
+            let actual = dataManager.allUpNextPlaylistEpisodes().map(\.episodeUuid)
+            audit.expectedQueueEpisodes = expected.count
+            audit.actualQueueEpisodes = actual.count
+            audit.queueOrderMatches = actual == expected
+        }
+
+        let playlistNames = Set(
+            dataManager.allPlaylists(includeDeleted: false).map(\.playlistName)
+        )
+        audit.verifiedPlaylistSnapshots = bundle.playlists.filter {
+            $0.preset == 0 && !$0.deleted && !$0.orderedEpisodeIds.isEmpty &&
+                playlistNames.contains($0.title)
+        }.count
+
+        let presentAudio = bundle.audioRecords.filter(\.present)
+        let candidates = audioLimit == nil ? presentAudio : presentAudio.filter {
+            guard let relativePath = $0.relativePath,
+                  let file = preservedAudioURL(relativePath, in: bundle.directory)
+            else { return false }
+            return FileManager.default.fileExists(atPath: file.path)
+        }
+        for audio in audioLimit.map({ Array(candidates.prefix($0)) }) ?? candidates {
+            guard let source = sourceEpisodes[audio.sourceEpisodeId],
+                  let podcast = podcastsBySourceId[source.sourcePodcastId],
+                  let destination = matchingEpisode(
+                      source,
+                      in: episodesByPodcastId[podcast.id] ?? []
+                  ),
+                  destination.downloaded(pathFinder: downloadManager)
+            else { continue }
+            audit.verifiedAudioFiles += 1
+        }
+        return audit
+    }
+
+    static func writeReconciliationReport(
+        bundle: Bundle,
+        report: Reconciliation,
+        stage: String,
+        audit: DestinationAudit? = nil
+    ) throws -> URL {
+        let unresolved = report.unresolvedRecords.isEmpty
+            ? "- None"
+            : report.unresolvedRecords.map { record in
+                let podcast = record.podcastTitle.replacingOccurrences(of: "\n", with: " ")
+                let title = record.episodeTitle.replacingOccurrences(of: "\n", with: " ")
+                return "- [\(record.sourceEpisodeId)] \(podcast) — \(title) — published \(record.publishedTime) — \(record.enclosureURL) — \(record.reason)"
+            }.joined(separator: "\n")
+        let auditSection: String
+        if let audit {
+            auditSection = """
+
+            Post-refresh destination audit
+            - Matched library shows: \(audit.matchedLibraryShows)
+            - Matched subscriptions: \(audit.matchedSubscriptions)
+            - Unresolved subscriptions: \(audit.unresolvedSubscriptions)
+            - Matched stateful episodes: \(audit.matchedStatefulEpisodes)
+            - Playback states verified: \(audit.verifiedPlaybackStates)
+            - Stars verified: \(audit.verifiedStars)
+            - Listening-history dates verified: \(audit.verifiedHistoryDates)
+            - Show-setting records verified: \(audit.verifiedShowSettings)
+            - Old library shows verified unsubscribed: \(audit.verifiedUnsubscribedLibraryShows)
+            - Queue episodes expected after matching: \(audit.expectedQueueEpisodes)
+            - Queue episodes found: \(audit.actualQueueEpisodes)
+            - Exact queue order verified: \(audit.queueOrderMatches)
+            - Playlist snapshots verified by name: \(audit.verifiedPlaylistSnapshots)
+            - Preserved audio files verified: \(audit.verifiedAudioFiles)
+            """
+        } else {
+            auditSection = """
+
+            Post-refresh destination audit
+            - Not run for this staged report.
+            """
+        }
+        let contents = """
+        Overcast → Pocket Casts Reconciliation
+
+        Stage: \(stage)
+
+        Source
+        - Library shows: \(bundle.sourcePodcasts.count)
+        - Library shows needed for state restoration: \(sourcePodcastsForImport(bundle).count)
+        - Subscriptions: \(bundle.manifest.counts.subscriptions)
+        - Episodes: \(bundle.manifest.counts.episodes)
+        - Download candidates: \(bundle.manifest.counts.downloadedCandidates)
+        - In-progress episodes: \(bundle.manifest.counts.inProgress)
+        - Completed episodes: \(bundle.manifest.counts.completed)
+        - Starred episodes: \(bundle.manifest.counts.starred)
+        - Playlists: \(bundle.manifest.counts.playlists)
+
+        Destination results
+        - Matched subscriptions: \(report.matchedSubscriptions)
+        - Unresolved subscriptions: \(report.unresolvedSubscriptions)
+        - Matched stateful episodes: \(report.matchedEpisodes)
+        - Unresolved stateful episodes: \(report.unresolvedEpisodes)
+        - Playback states restored: \(report.restoredPlaybackStates)
+        - Stars restored: \(report.restoredStars)
+        - Listening-history dates restored: \(report.restoredHistoryDates)
+        - Current episode restored: \(report.restoredCurrentEpisode)
+        - Show settings restored: \(report.restoredShowSettings)
+        - Old library shows restored to unsubscribed: \(report.restoredUnsubscribedLibraryShows)
+        - Queue episodes restored: \(report.restoredQueueEpisodes)
+        - Playlist snapshots restored: \(report.restoredPlaylists)
+        - Unresolved queue or playlist episodes: \(report.unresolvedCollectionEpisodes)
+        - Preserved audio files imported: \(report.importedAudioFiles)
+        - Unresolved preserved audio files: \(report.unresolvedAudioFiles)
+        - Downloads queued: \(report.queuedRedownloads)
+        - Raw Overcast deletion markers ignored: \(report.ignoredOvercastDeletionMarkers)
+
+        Unresolved episode details
+        \(unresolved)
+        \(auditSection)
+        """
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("overcast-migration-reconciliation-\(UUID().uuidString).txt")
+        try Data(contents.utf8).write(to: file, options: .atomic)
+        return file
+    }
+
+    /// Captures Pocket Casts' database, WAL, and preferences before the first
+    /// migration write. The backup uses the app's existing `.pcasts` format
+    /// and remains in Documents so it can be copied off the device.
+    static func writePocketCastsBackup() throws -> URL {
+        let documents = try documentsDirectory()
+        let directory = documents.appendingPathComponent(
+            "OvercastMigrationBackups",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        let timestamp = formatter.string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        let backup = directory.appendingPathComponent(
+            "PocketCasts-before-Overcast-\(timestamp).pcasts",
+            isDirectory: true
+        )
+        let wrapper = try PCBundleDoc().fileWrapper()
+        try wrapper.write(to: backup, originalContentsURL: nil)
+        return backup
+    }
+
+    static func preserveReconciliationReport(
+        _ report: URL,
+        rehearsal: Bool
+    ) throws -> URL {
+        let name = rehearsal
+            ? "OvercastMigrationQACompleteReport.txt"
+            : "OvercastMigrationCompleteReport.txt"
+        let destination = try documentsDirectory().appendingPathComponent(name)
+        try Data(contentsOf: report).write(to: destination, options: .atomic)
+        return destination
+    }
+
     /// Creates a temporary OPML document for the existing, audited OPML
     /// importer. The caller is responsible for presenting an explicit import
     /// action; merely writing this file never changes a subscription.
     static func writeOPML(bundle: Bundle) throws -> URL {
-        let feeds = Array(Set(bundle.subscriptions.compactMap(\.feedURL))).sorted()
+        let feeds = importFeedURLs(bundle)
         let outlines = feeds.map { feed in
             "  <outline type=\"rss\" xmlUrl=\"\(xmlEscaped(feed))\" />"
         }.joined(separator: "\n")
@@ -651,22 +1332,66 @@ enum OvercastMigration {
     }
 
     private static func shouldRestore(_ episode: Episode, restoreDownloads: Bool) -> Bool {
-        episode.playbackState != .notStarted || episode.starredTime > 0 || (restoreDownloads && episode.downloadRequested)
+        episode.playbackState != .notStarted || episode.starredTime > 0 ||
+            episode.lastPlayedTime > 0 || (restoreDownloads && episode.downloadRequested)
     }
 
-    private static func matchingEpisode(_ source: Episode, in destination: [PocketCastsDataModel.Episode]) -> PocketCastsDataModel.Episode? {
-        if let exact = destination.first(where: { $0.downloadUrl == source.enclosureURL }) {
-            return exact
+    private struct EpisodeMatch {
+        let episode: PocketCastsDataModel.Episode?
+        let failureReason: String
+    }
+
+    private static func episodeMatch(_ source: Episode, in destination: [PocketCastsDataModel.Episode]) -> EpisodeMatch {
+        let exact = destination.filter { $0.downloadUrl == source.enclosureURL }
+        if exact.count == 1 {
+            return EpisodeMatch(episode: exact[0], failureReason: "")
+        }
+        if exact.count > 1 {
+            return EpisodeMatch(episode: nil, failureReason: "multiple enclosure-URL matches")
         }
         let published = Date(timeIntervalSince1970: TimeInterval(source.publishedTime))
-        if let titleAndDate = destination.first(where: {
+        let titleAndDate = destination.filter {
             $0.title == source.title && abs(($0.publishedDate ?? .distantPast).timeIntervalSince(published)) < 300
-        }) {
-            return titleAndDate
         }
-        return destination.first(where: {
+        if titleAndDate.count == 1 {
+            return EpisodeMatch(episode: titleAndDate[0], failureReason: "")
+        }
+        if titleAndDate.count > 1 {
+            return EpisodeMatch(episode: nil, failureReason: "multiple title-and-date matches")
+        }
+        let titleAndDuration = destination.filter {
             $0.title == source.title && abs($0.duration - Double(source.advertisedDuration)) < 2
-        })
+        }
+        if titleAndDuration.count == 1 {
+            return EpisodeMatch(episode: titleAndDuration[0], failureReason: "")
+        }
+        let reason = titleAndDuration.isEmpty
+            ? "no enclosure-URL, title-and-date, or title-and-duration match"
+            : "multiple title-and-duration matches"
+        return EpisodeMatch(episode: nil, failureReason: reason)
+    }
+
+    private static func matchingEpisode(
+        _ source: Episode,
+        in destination: [PocketCastsDataModel.Episode]
+    ) -> PocketCastsDataModel.Episode? {
+        episodeMatch(source, in: destination).episode
+    }
+
+    private static func unresolvedRecord(
+        _ source: Episode,
+        stage: String,
+        reason: String
+    ) -> UnresolvedRecord {
+        UnresolvedRecord(
+            stage: stage,
+            sourceEpisodeId: source.sourceEpisodeId,
+            podcastTitle: source.podcastTitle,
+            episodeTitle: source.title,
+            publishedTime: source.publishedTime,
+            enclosureURL: source.enclosureURL,
+            reason: reason
+        )
     }
 
     static func canonicalFeedURL(_ raw: String?) -> String? {
@@ -686,6 +1411,9 @@ enum OvercastMigration {
         case unsupportedFormat(String)
         case unsupportedVersion(Int)
         case testOnlyBundle
+        case invalidQAOutput(String)
+        case invalidArtifactName(String)
+        case artifactChecksumMismatch(String)
 
         var errorDescription: String? {
             switch self {
@@ -693,8 +1421,266 @@ enum OvercastMigration {
             case let .unsupportedFormat(format): "Unsupported migration format: \(format)."
             case let .unsupportedVersion(version): "Unsupported migration format version: \(version)."
             case .testOnlyBundle: "A test-only migration bundle cannot be imported."
+            case let .invalidQAOutput(message): "Migration rehearsal failed: \(message)"
+            case let .invalidArtifactName(name): "Migration bundle contains an invalid artifact name: \(name)."
+            case let .artifactChecksumMismatch(name): "Migration bundle artifact failed its checksum: \(name)."
             }
         }
+    }
+}
+
+/// Runs the complete migration through Pocket Casts' normal import, model,
+/// queue, download, and refresh services. The developer screen provides the
+/// explicit production confirmation; the rehearsal mode is for a disposable
+/// simulator and imports only one audio file to prove that path without
+/// duplicating the full archive.
+@MainActor
+final class OvercastMigrationRunner: ObservableObject {
+    enum Mode {
+        case rehearsal
+        case production
+
+        var audioLimit: Int? {
+            switch self {
+            case .rehearsal: 1
+            case .production: nil
+            }
+        }
+
+        var reportStage: String {
+            switch self {
+            case .rehearsal: "Complete disposable-simulator rehearsal"
+            case .production: "Complete production import"
+            }
+        }
+
+        var isRehearsal: Bool {
+            switch self {
+            case .rehearsal: true
+            case .production: false
+            }
+        }
+    }
+
+    @Published private(set) var isRunning = false
+    @Published private(set) var status = "Ready"
+    @Published private(set) var backupURL: URL?
+    @Published private(set) var reportURL: URL?
+
+    private var bundle: OvercastMigration.Bundle?
+    private var mode: Mode?
+    private var opmlURL: URL?
+    private var notificationTokens = [NSObjectProtocol]()
+    private var securityScopedURL: URL?
+
+    func runInstalled(mode: Mode) {
+        do {
+            try run(bundleURL: OvercastMigration.installedBundleURL(), mode: mode)
+        } catch {
+            fail(error.localizedDescription)
+        }
+    }
+
+    func run(bundleURL: URL, mode: Mode) throws {
+        guard !isRunning else { return }
+        isRunning = true
+        status = "Verifying migration bundle"
+        reportURL = nil
+
+        let hasAccess = bundleURL.startAccessingSecurityScopedResource()
+        if hasAccess {
+            securityScopedURL = bundleURL
+        }
+
+        do {
+            let bundle = try OvercastMigration.Bundle.load(from: bundleURL)
+            let backup = try OvercastMigration.writePocketCastsBackup()
+            let opml = try OvercastMigration.writeOPML(bundle: bundle)
+            self.bundle = bundle
+            self.mode = mode
+            backupURL = backup
+            opmlURL = opml
+            observeOPMLImport()
+            status = "Importing \(OvercastMigration.importFeedURLs(bundle).count) feeds needed for subscriptions and library state"
+            PodcastManager.shared.importPodcastsFromOpml(opml)
+        } catch {
+            finishSecurityScope()
+            isRunning = false
+            throw error
+        }
+    }
+
+    private func observeOPMLImport() {
+        let center = NotificationCenter.default
+        notificationTokens.append(center.addObserver(
+            forName: Constants.Notifications.opmlImportCompleted,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.restoreImportedState()
+            }
+        })
+        notificationTokens.append(center.addObserver(
+            forName: Constants.Notifications.opmlImportFailed,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.fail("Pocket Casts could not parse or start the OPML import.")
+            }
+        })
+    }
+
+    private func restoreImportedState() {
+        removeObservers()
+        guard let bundle, let mode else {
+            fail("Migration state was lost before restoration.")
+            return
+        }
+        status = "Restoring matched state, Up Next, playlists, and preserved audio"
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let podcasts = DataManager.sharedManager.allPodcasts(
+                includeUnsubscribed: true,
+                reloadFromDatabase: true
+            )
+            var report = OvercastMigration.restoreExistingState(
+                bundle: bundle,
+                podcasts: podcasts
+            )
+            report.merge(OvercastMigration.restoreCollections(
+                bundle: bundle,
+                podcasts: podcasts,
+                playbackQueue: PlaybackManager.shared.queue
+            ))
+            report.merge(OvercastMigration.restorePreservedAudio(
+                bundle: bundle,
+                podcasts: podcasts,
+                limit: mode.audioLimit
+            ))
+            report.merge(OvercastMigration.restoreSubscriptionMembership(
+                bundle: bundle,
+                podcasts: podcasts
+            ))
+
+            do {
+                let temporaryReport = try OvercastMigration.writeReconciliationReport(
+                    bundle: bundle,
+                    report: report,
+                    stage: mode.reportStage
+                )
+                let reportURL = try OvercastMigration.preserveReconciliationReport(
+                    temporaryReport,
+                    rehearsal: mode.isRehearsal
+                )
+                try? FileManager.default.removeItem(at: temporaryReport)
+                DispatchQueue.main.async { [weak self] in
+                    self?.reportURL = reportURL
+                    self?.status = "Synchronizing and refreshing Pocket Casts"
+                    RefreshManager.shared.refreshPodcasts { result in
+                        DispatchQueue.main.async { [weak self] in
+                            switch result {
+                            case .newData, .noData:
+                                self?.auditAndComplete(
+                                    bundle: bundle,
+                                    mode: mode,
+                                    report: report
+                                )
+                            case .failed:
+                                self?.fail(
+                                    "Local import finished, but the final Pocket Casts refresh/sync failed. The reconciliation report was preserved."
+                                )
+                            }
+                        }
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    self?.fail(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func auditAndComplete(
+        bundle: OvercastMigration.Bundle,
+        mode: Mode,
+        report: OvercastMigration.Reconciliation
+    ) {
+        status = "Auditing the refreshed Pocket Casts destination"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let podcasts = DataManager.sharedManager.allPodcasts(
+                includeUnsubscribed: true,
+                reloadFromDatabase: true
+            )
+            let audit = OvercastMigration.auditDestination(
+                bundle: bundle,
+                podcasts: podcasts,
+                audioLimit: mode.audioLimit
+            )
+            do {
+                let temporaryReport = try OvercastMigration.writeReconciliationReport(
+                    bundle: bundle,
+                    report: report,
+                    stage: mode.reportStage,
+                    audit: audit
+                )
+                let reportURL = try OvercastMigration.preserveReconciliationReport(
+                    temporaryReport,
+                    rehearsal: mode.isRehearsal
+                )
+                try? FileManager.default.removeItem(at: temporaryReport)
+                DispatchQueue.main.async { [weak self] in
+                    self?.reportURL = reportURL
+                    self?.complete()
+                }
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    self?.fail(
+                        "Pocket Casts refreshed, but the final destination audit report could not be saved: \(error.localizedDescription)"
+                    )
+                }
+            }
+        }
+    }
+
+    private func complete() {
+        status = "Migration finished; review the reconciliation report"
+        isRunning = false
+        cleanupTemporaryOPML()
+        finishSecurityScope()
+        bundle = nil
+        mode = nil
+    }
+
+    private func fail(_ message: String) {
+        status = "Failed: \(message)"
+        isRunning = false
+        removeObservers()
+        cleanupTemporaryOPML()
+        finishSecurityScope()
+        bundle = nil
+        mode = nil
+    }
+
+    private func removeObservers() {
+        for token in notificationTokens {
+            NotificationCenter.default.removeObserver(token)
+        }
+        notificationTokens.removeAll()
+    }
+
+    private func cleanupTemporaryOPML() {
+        if let opmlURL {
+            try? FileManager.default.removeItem(at: opmlURL)
+        }
+        opmlURL = nil
+    }
+
+    private func finishSecurityScope() {
+        securityScopedURL?.stopAccessingSecurityScopedResource()
+        securityScopedURL = nil
     }
 }
 

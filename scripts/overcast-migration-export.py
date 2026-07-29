@@ -206,9 +206,25 @@ def extract(connection: sqlite3.Connection, episode_limit: int | None = None) ->
         LIMIT 1
     """)
 
+    last_session_by_episode: dict[int, int] = {}
+    for session in playback_sessions:
+        if session["deleted"]:
+            continue
+        episode_id = session["source_episode_id"]
+        last_session_by_episode[episode_id] = max(
+            last_session_by_episode.get(episode_id, 0),
+            session["updated_time"],
+        )
+
     for episode in episodes:
         duration = episode["advertised_duration"]
         progress = episode["progress_seconds"]
+        # The inspected Mac database leaves userLastPlayedTime at zero while
+        # retaining recent listening activity in OCPlaybackSession.
+        episode["last_played_time"] = max(
+            episode["last_played_time"],
+            last_session_by_episode.get(episode["source_episode_id"], 0),
+        )
         episode["playback_state"] = (
             "not_started" if progress == 0
             else "completed" if duration > 0 and progress >= duration
@@ -221,6 +237,7 @@ def extract(connection: sqlite3.Connection, episode_limit: int | None = None) ->
         "title", "author", "language", "link_url", "image_url", "itunes_id", "subscribed", "sort_order"
     }} for podcast in podcasts]
     return {
+        "podcasts": podcasts,
         "subscriptions": subscriptions,
         "episodes": episodes,
         "playlists": playlists,
@@ -236,6 +253,7 @@ def extract(connection: sqlite3.Connection, episode_limit: int | None = None) ->
             "in_progress": sum(episode["playback_state"] == "in_progress" for episode in episodes),
             "completed": sum(episode["playback_state"] == "completed" for episode in episodes),
             "starred": sum(episode["starred_time"] > 0 for episode in episodes),
+            "history_dates": sum(episode["last_played_time"] > 0 for episode in episodes),
             "playlists": len(playlists), "playback_sessions": len(playback_sessions),
         },
     }
@@ -291,7 +309,7 @@ def main() -> int:
         "counts": bundle["counts"],
     }
     write_json(output, "manifest.json", manifest)
-    for name in ("subscriptions", "episodes", "queues", "playlists", "show_settings", "playback_state"):
+    for name in ("podcasts", "subscriptions", "episodes", "queues", "playlists", "show_settings", "playback_state"):
         write_json(output, f"{name}.json", bundle[name])
     (output / "validation-report.html").write_text(report(bundle["counts"]), encoding="utf-8")
     if args.audio_root:
@@ -301,6 +319,12 @@ def main() -> int:
         with open_source(args.database) as connection:
             downloaded_audio = inventory_downloaded_episode_audio(connection, args.database, output=output, copy_audio=True)
         write_json(output, "downloaded-audio-inventory.json", downloaded_audio)
+    checksummed_artifacts = sorted(path for path in output.iterdir() if path.is_file())
+    write_json(
+        output,
+        "artifact-checksums.json",
+        {path.name: sha256(path) for path in checksummed_artifacts},
+    )
     print(f"Wrote audited migration bundle to {output}")
     return 0
 

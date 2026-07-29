@@ -11,10 +11,14 @@ struct DeveloperMenu: View {
     @State var showingOvercastMigrationSubscriptionImporter = false
     @State var showingOvercastMigrationStateImporter = false
     @State var showingOvercastMigrationCollectionsImporter = false
+    @State var confirmingOvercastMigrationCollectionsImport = false
+    @State var confirmingCompleteOvercastMigration = false
     @State var showingOvercastMigrationAudioImporter = false
     @State var showingOvercastMigrationReportImporter = false
+    @State var showingCompleteOvercastMigrationImporter = false
     @State var overcastMigrationReport: String?
     @State var overcastMigrationReportURL: URL?
+    @State var selectedCompleteOvercastMigrationURL: URL?
     @State var showingPlaylistsOnboarding = false
     @State var showingRecommendationsOnboarding = false
     @State var showingInterestsOnboarding = false
@@ -25,6 +29,7 @@ struct DeveloperMenu: View {
     @State var showingNotificationsPermissions = false
     @State var enableDebugPlaylistLimit = false
 
+    @StateObject private var overcastMigrationRunner = OvercastMigrationRunner()
     @StateObject var recommendationsViewModel = RecommendationsViewModel(configuration: .all)
 
     var body: some View {
@@ -128,6 +133,66 @@ struct DeveloperMenu: View {
                         Text("Share Overcast Reconciliation Report")
                     }
                 }
+                Button("Run Installed Overcast Rehearsal") {
+                    overcastMigrationRunner.runInstalled(mode: .rehearsal)
+                }
+                .disabled(overcastMigrationRunner.isRunning)
+                Button("Choose Bundle and Run Complete Overcast Migration") {
+                    showingCompleteOvercastMigrationImporter = true
+                }
+                .disabled(overcastMigrationRunner.isRunning)
+                .fileImporter(
+                    isPresented: $showingCompleteOvercastMigrationImporter,
+                    allowedContentTypes: [.folder]
+                ) { result in
+                    switch result {
+                    case let .success(url):
+                        selectedCompleteOvercastMigrationURL = url
+                        confirmingCompleteOvercastMigration = true
+                    case let .failure(error):
+                        overcastMigrationReport = error.localizedDescription
+                    }
+                }
+                Button("Run Complete Installed Overcast Migration") {
+                    selectedCompleteOvercastMigrationURL = nil
+                    confirmingCompleteOvercastMigration = true
+                }
+                .disabled(overcastMigrationRunner.isRunning)
+                .confirmationDialog(
+                    "Import the installed Overcast bundle into this Pocket Casts account?",
+                    isPresented: $confirmingCompleteOvercastMigration,
+                    titleVisibility: .visible
+                ) {
+                    Button("Back Up and Import Everything", role: .destructive) {
+                        if let selectedCompleteOvercastMigrationURL {
+                            do {
+                                try overcastMigrationRunner.run(
+                                    bundleURL: selectedCompleteOvercastMigrationURL,
+                                    mode: .production
+                                )
+                            } catch {
+                                overcastMigrationReport = error.localizedDescription
+                            }
+                        } else {
+                            overcastMigrationRunner.runInstalled(mode: .production)
+                        }
+                        selectedCompleteOvercastMigrationURL = nil
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("This subscribes to shows, restores matched state and audio, and replaces Up Next. A Pocket Casts backup and reconciliation report are written first.")
+                }
+                Text(overcastMigrationRunner.status)
+                if let backupURL = overcastMigrationRunner.backupURL {
+                    ShareLink(item: backupURL) {
+                        Text("Share Pre-Migration Pocket Casts Backup")
+                    }
+                }
+                if let reportURL = overcastMigrationRunner.reportURL {
+                    ShareLink(item: reportURL) {
+                        Text("Share Complete Migration Report")
+                    }
+                }
                 Button("Subscribe from Overcast Migration") {
                     showingOvercastMigrationSubscriptionImporter.toggle()
                 }
@@ -170,6 +235,11 @@ struct DeveloperMenu: View {
                                 bundle: bundle,
                                 podcasts: DataManager.sharedManager.allPodcasts(includeUnsubscribed: true)
                             )
+                            overcastMigrationReportURL = try OvercastMigration.writeReconciliationReport(
+                                bundle: bundle,
+                                report: report,
+                                stage: "Episode state and show settings"
+                            )
                             overcastMigrationReport = """
                             Matched subscriptions: \(report.matchedSubscriptions)
                             Unresolved subscriptions: \(report.unresolvedSubscriptions)
@@ -191,7 +261,17 @@ struct DeveloperMenu: View {
                     }
                 }
                 Button("Restore Overcast Queue + Playlists") {
-                    showingOvercastMigrationCollectionsImporter.toggle()
+                    confirmingOvercastMigrationCollectionsImport = true
+                }
+                .confirmationDialog(
+                    "Replace Pocket Casts Up Next with the Overcast queue?",
+                    isPresented: $confirmingOvercastMigrationCollectionsImport,
+                    titleVisibility: .visible
+                ) {
+                    Button("Choose Bundle and Replace Up Next", role: .destructive) {
+                        showingOvercastMigrationCollectionsImporter = true
+                    }
+                    Button("Cancel", role: .cancel) {}
                 }
                 .fileImporter(isPresented: $showingOvercastMigrationCollectionsImporter, allowedContentTypes: [.folder]) { result in
                     switch result {
@@ -203,6 +283,11 @@ struct DeveloperMenu: View {
                             let report = OvercastMigration.restoreCollections(
                                 bundle: bundle,
                                 podcasts: DataManager.sharedManager.allPodcasts(includeUnsubscribed: true)
+                            )
+                            overcastMigrationReportURL = try OvercastMigration.writeReconciliationReport(
+                                bundle: bundle,
+                                report: report,
+                                stage: "Up Next and playlist snapshots"
                             )
                             overcastMigrationReport = """
                             Queue episodes restored: \(report.restoredQueueEpisodes)
@@ -229,6 +314,11 @@ struct DeveloperMenu: View {
                             let report = OvercastMigration.restorePreservedAudio(
                                 bundle: bundle,
                                 podcasts: DataManager.sharedManager.allPodcasts(includeUnsubscribed: true)
+                            )
+                            overcastMigrationReportURL = try OvercastMigration.writeReconciliationReport(
+                                bundle: bundle,
+                                report: report,
+                                stage: "Preserved audio"
                             )
                             overcastMigrationReport = """
                             Preserved audio files imported: \(report.importedAudioFiles)
