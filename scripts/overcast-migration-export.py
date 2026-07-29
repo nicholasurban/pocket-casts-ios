@@ -15,6 +15,7 @@ import html
 import json
 import shutil
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,27 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def preserve_file(source: Path, destination: Path) -> str:
+    """Preserve a file without needlessly duplicating APFS blocks.
+
+    `cp -c` creates a copy-on-write clone on APFS. The destination remains a
+    real, independently deletable file and retains the shared blocks if the
+    source is later removed. Ordinary copy is the portable fallback.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "darwin":
+        cloned = subprocess.run(
+            ["/bin/cp", "-c", str(source), str(destination)],
+            capture_output=True,
+            check=False,
+        )
+        if cloned.returncode == 0:
+            shutil.copystat(source, destination)
+            return "apfs_clone"
+    shutil.copy2(source, destination)
+    return "copy"
+
+
 def inventory_audio(roots: list[Path], output: Path | None, copy_audio: bool) -> list[dict[str, Any]]:
     inventory: list[dict[str, Any]] = []
     for root in roots:
@@ -62,8 +84,7 @@ def inventory_audio(roots: list[Path], output: Path | None, copy_audio: bool) ->
             if copy_audio and not incomplete:
                 assert output is not None
                 destination = output / "audio" / root.name / candidate.relative_to(root)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(candidate, destination)
+                record["preservation_method"] = preserve_file(candidate, destination)
     return inventory
 
 
@@ -107,8 +128,7 @@ def inventory_downloaded_episode_audio(connection: sqlite3.Connection, database:
             if copy_audio:
                 assert output is not None
                 destination = output / "audio" / source.name
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, destination)
+                record["preservation_method"] = preserve_file(source, destination)
         inventory.append(record)
     return inventory
 
