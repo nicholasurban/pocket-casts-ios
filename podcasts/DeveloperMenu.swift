@@ -12,7 +12,9 @@ struct DeveloperMenu: View {
     @State var showingOvercastMigrationStateImporter = false
     @State var showingOvercastMigrationCollectionsImporter = false
     @State var showingOvercastMigrationAudioImporter = false
+    @State var showingOvercastMigrationReportImporter = false
     @State var overcastMigrationReport: String?
+    @State var overcastMigrationReportURL: URL?
     @State var showingPlaylistsOnboarding = false
     @State var showingRecommendationsOnboarding = false
     @State var showingInterestsOnboarding = false
@@ -99,6 +101,32 @@ struct DeveloperMenu: View {
                     Button("OK", role: .cancel) { overcastMigrationReport = nil }
                 } message: {
                     Text(overcastMigrationReport ?? "")
+                }
+                Button("Create Overcast Reconciliation Report") {
+                    showingOvercastMigrationReportImporter.toggle()
+                }
+                .fileImporter(isPresented: $showingOvercastMigrationReportImporter, allowedContentTypes: [.folder]) { result in
+                    switch result {
+                    case let .success(url):
+                        let hasAccess = url.startAccessingSecurityScopedResource()
+                        defer { if hasAccess { url.stopAccessingSecurityScopedResource() } }
+                        do {
+                            let bundle = try OvercastMigration.Bundle.load(from: url)
+                            overcastMigrationReportURL = try OvercastMigration.writePreflightReport(
+                                bundle: bundle,
+                                podcasts: DataManager.sharedManager.allPodcasts(includeUnsubscribed: true)
+                            )
+                        } catch {
+                            overcastMigrationReport = error.localizedDescription
+                        }
+                    case let .failure(error):
+                        overcastMigrationReport = error.localizedDescription
+                    }
+                }
+                if let overcastMigrationReportURL {
+                    ShareLink(item: overcastMigrationReportURL) {
+                        Text("Share Overcast Reconciliation Report")
+                    }
                 }
                 Button("Subscribe from Overcast Migration") {
                     showingOvercastMigrationSubscriptionImporter.toggle()

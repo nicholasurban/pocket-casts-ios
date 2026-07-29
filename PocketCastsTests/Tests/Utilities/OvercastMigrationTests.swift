@@ -13,10 +13,10 @@ final class OvercastMigrationTests: XCTestCase {
         [{"id":1,"feed_url":"https://example.com/feed","title":"Example"}]
         """, named: "subscriptions.json", in: directory)
         try write("""
-        [{"source_episode_id":2,"source_podcast_id":1,"feed_url":"https://example.com/feed","podcast_title":"Example","published_time":1700000000,"title":"Episode","enclosure_url":"https://example.com/episode.mp3","advertised_duration":60,"progress_seconds":0,"archived":true,"starred_time":0,"download_requested":false,"playback_state":"not_started"}]
+        [{"source_episode_id":2,"source_podcast_id":1,"feed_url":"https://example.com/feed","podcast_title":"Example","published_time":1700000000,"title":"Episode","enclosure_url":"https://example.com/episode.mp3","advertised_duration":60,"progress_seconds":0,"archived":1,"starred_time":0,"download_requested":false,"playback_state":"not_started"}]
         """, named: "episodes.json", in: directory)
         try write("[]", named: "show_settings.json", in: directory)
-        try write("[]", named: "playlists.json", in: directory)
+        try write("[{\"title\":\"Queue\",\"preset\":8,\"included_episode_ids\":\"2,3\",\"manual_sort\":\"3,2\",\"individual_episodes_only\":1,\"deleted\":0}]", named: "playlists.json", in: directory)
         try write("[]", named: "downloaded-audio-inventory.json", in: directory)
         try write("{\"current_source_episode_id\":null,\"sessions\":[]}", named: "playback_state.json", in: directory)
 
@@ -24,6 +24,9 @@ final class OvercastMigrationTests: XCTestCase {
         let plan = OvercastMigration.dryRun(bundle: bundle, podcasts: [])
 
         XCTAssertTrue(bundle.episodes[0].overcastDeleted)
+        XCTAssertTrue(bundle.playlists[0].individualEpisodesOnly)
+        XCTAssertFalse(bundle.playlists[0].deleted)
+        XCTAssertEqual(bundle.playlists[0].orderedEpisodeIds, [3, 2])
         XCTAssertEqual(plan.statefulEpisodes, 0)
         XCTAssertEqual(plan.ignoredOvercastDeletionMarkers, 1)
     }
@@ -49,6 +52,37 @@ final class OvercastMigrationTests: XCTestCase {
 
         XCTAssertEqual(contents.components(separatedBy: "xmlUrl=").count - 1, 1)
         XCTAssertTrue(contents.contains("a=1&amp;b=2"))
+    }
+
+    func testPreflightReportExplainsUnresolvedAndUnsafeState() throws {
+        let directory = try makeBundleDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try write("""
+        {"format":"overcast-migration","format_version":1,"test_only":false,"counts":{"subscriptions":1,"episodes":1,"downloaded_candidates":1,"in_progress":0,"completed":0,"starred":0,"playlists":1}}
+        """, named: "manifest.json", in: directory)
+        try write("""
+        [{"id":1,"feed_url":null,"title":"Missing Feed"}]
+        """, named: "subscriptions.json", in: directory)
+        try write("""
+        [{"source_episode_id":2,"source_podcast_id":1,"feed_url":null,"podcast_title":"Missing Feed","published_time":1700000000,"title":"Episode","enclosure_url":"https://example.com/episode.mp3","advertised_duration":60,"progress_seconds":0,"overcast_deleted":1,"starred_time":0,"download_requested":true,"playback_state":"not_started"}]
+        """, named: "episodes.json", in: directory)
+        try write("[]", named: "show_settings.json", in: directory)
+        try write("[{\"title\":\"Smart\",\"preset\":2,\"included_episode_ids\":null,\"manual_sort\":null,\"individual_episodes_only\":0,\"deleted\":0}]", named: "playlists.json", in: directory)
+        try write("[{\"source_episode_id\":2,\"present\":false,\"relative_path\":null,\"sha256\":null}]", named: "downloaded-audio-inventory.json", in: directory)
+        try write("{\"current_source_episode_id\":null,\"sessions\":[]}", named: "playback_state.json", in: directory)
+
+        let reportURL = try OvercastMigration.writePreflightReport(
+            bundle: try .load(from: directory),
+            podcasts: []
+        )
+        defer { try? FileManager.default.removeItem(at: reportURL) }
+        let report = try String(contentsOf: reportURL)
+
+        XCTAssertTrue(report.contains("Not yet present or unresolved: 1"))
+        XCTAssertTrue(report.contains("[1] Missing Feed — (missing feed URL)"))
+        XCTAssertTrue(report.contains("1 raw Overcast removal markers will NOT be mapped"))
+        XCTAssertTrue(report.contains("Missing audio will NOT be redownloaded"))
+        XCTAssertTrue(report.contains("Smart (Overcast preset 2"))
     }
 
     private func makeBundleDirectory() throws -> URL {

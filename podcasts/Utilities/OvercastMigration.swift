@@ -139,8 +139,8 @@ enum OvercastMigration {
             progressSeconds = try container.decode(Int.self, forKey: .progressSeconds)
             lastPlayedTime = try container.decodeIfPresent(Int64.self, forKey: .lastPlayedTime) ?? 0
             // Bundles made before the field was clarified used `archived`.
-            overcastDeleted = try container.decodeIfPresent(Bool.self, forKey: .overcastDeleted)
-                ?? container.decodeIfPresent(Bool.self, forKey: .archived)
+            overcastDeleted = try container.decodeSQLiteBooleanIfPresent(forKey: .overcastDeleted)
+                ?? container.decodeSQLiteBooleanIfPresent(forKey: .archived)
                 ?? false
             starredTime = try container.decode(Int64.self, forKey: .starredTime)
             downloadRequested = try container.decode(Bool.self, forKey: .downloadRequested)
@@ -161,6 +161,16 @@ enum OvercastMigration {
             case includedEpisodeIds = "included_episode_ids"
             case manualSort = "manual_sort"
             case individualEpisodesOnly = "individual_episodes_only"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            title = try container.decode(String.self, forKey: .title)
+            preset = try container.decode(Int.self, forKey: .preset)
+            includedEpisodeIds = try container.decodeIfPresent(String.self, forKey: .includedEpisodeIds)
+            manualSort = try container.decodeIfPresent(String.self, forKey: .manualSort)
+            individualEpisodesOnly = try container.decodeSQLiteBooleanIfPresent(forKey: .individualEpisodesOnly) ?? false
+            deleted = try container.decodeSQLiteBooleanIfPresent(forKey: .deleted) ?? false
         }
 
         var orderedEpisodeIds: [Int64] {
@@ -242,6 +252,95 @@ enum OvercastMigration {
         let ignoredOvercastDeletionMarkers: Int
     }
 
+    /// Writes a durable, human-readable preflight report without changing
+    /// either app. Exact episode reconciliation remains a post-refresh step,
+    /// so this report clearly separates known matches from work that cannot be
+    /// verified until Pocket Casts has refreshed the imported feeds.
+    static func writePreflightReport(bundle: Bundle, podcasts: [Podcast]) throws -> URL {
+        let destinationFeeds = Set(podcasts.compactMap { canonicalFeedURL($0.podcastUrl) })
+        let sourceSubscriptions = bundle.subscriptions.sorted {
+            $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        }
+        let unresolved = sourceSubscriptions.filter {
+            guard let feed = canonicalFeedURL($0.feedURL) else { return true }
+            return !destinationFeeds.contains(feed)
+        }
+        let missingFeed = sourceSubscriptions.filter { canonicalFeedURL($0.feedURL) == nil }
+        let manualPlaylists = bundle.playlists.filter {
+            $0.preset == 0 && $0.individualEpisodesOnly && !$0.deleted
+        }
+        let queueEpisodes = bundle.playlists.first {
+            $0.preset == 8 && !$0.deleted
+        }?.orderedEpisodeIds.count ?? 0
+        let untranslatedPlaylists = bundle.playlists.filter {
+            !$0.deleted && $0.preset != 8 &&
+                !($0.preset == 0 && $0.individualEpisodesOnly)
+        }
+        let presentAudio = bundle.audioRecords.filter(\.present)
+        let missingAudio = bundle.audioRecords.filter { !$0.present }
+        let plan = dryRun(bundle: bundle, podcasts: podcasts)
+
+        func subscriptionLine(_ subscription: Subscription) -> String {
+            let feed = subscription.feedURL ?? "(missing feed URL)"
+            return "- [\(subscription.sourcePodcastId)] \(subscription.title) — \(feed)"
+        }
+
+        func playlistLine(_ playlist: Playlist) -> String {
+            "- \(playlist.title) (Overcast preset \(playlist.preset), \(playlist.orderedEpisodeIds.count) explicit episodes)"
+        }
+
+        let unresolvedLines = unresolved.isEmpty
+            ? "- None"
+            : unresolved.map(subscriptionLine).joined(separator: "\n")
+        let missingFeedLines = missingFeed.isEmpty
+            ? "- None"
+            : missingFeed.map(subscriptionLine).joined(separator: "\n")
+        let untranslatedLines = untranslatedPlaylists.isEmpty
+            ? "- None"
+            : untranslatedPlaylists.map(playlistLine).joined(separator: "\n")
+
+        let report = """
+        Overcast → Pocket Casts Migration Preflight
+
+        This report is read-only. No Pocket Casts account or Overcast data was changed.
+
+        Source inventory
+        - Subscriptions: \(bundle.subscriptions.count)
+        - Episodes: \(bundle.episodes.count)
+        - Stateful episodes: \(plan.statefulEpisodes)
+        - Download candidates: \(plan.downloadedEpisodes)
+        - Preserved audio files: \(presentAudio.count)
+        - Missing source audio files: \(missingAudio.count)
+        - Queue episodes: \(queueEpisodes)
+        - Manual playlists eligible for restoration: \(manualPlaylists.count)
+
+        Subscription reconciliation before import
+        - Already present in Pocket Casts by canonical feed URL: \(plan.matchedSubscriptions)
+        - Not yet present or unresolved: \(plan.unresolvedSubscriptions)
+
+        Unresolved subscriptions
+        \(unresolvedLines)
+
+        Subscriptions missing a usable feed URL
+        \(missingFeedLines)
+
+        Safety decisions
+        - \(plan.ignoredOvercastDeletionMarkers) raw Overcast removal markers will NOT be mapped to Pocket Casts archive or deletion state.
+        - Missing audio will NOT be redownloaded unless the operator explicitly opts in.
+        - Preserved audio is imported only after its SHA-256 hash matches the bundle inventory.
+        - Episode state is applied only after an existing Pocket Casts episode matches by enclosure URL, or by audited title/date or title/duration fallback.
+        - Exact unresolved episode counts are available only after subscriptions import and feed refresh.
+
+        Overcast smart playlists preserved but not automatically translated
+        \(untranslatedLines)
+        """
+
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("overcast-migration-preflight-\(UUID().uuidString).txt")
+        try Data(report.utf8).write(to: file, options: .atomic)
+        return file
+    }
+
     struct Reconciliation {
         var matchedSubscriptions = 0
         var unresolvedSubscriptions = 0
@@ -269,9 +368,9 @@ enum OvercastMigration {
             $0.playbackState != .notStarted || $0.starredTime > 0
         }.count
         return DryRun(
-            sourceSubscriptions: sourceFeeds.count,
+            sourceSubscriptions: bundle.subscriptions.count,
             matchedSubscriptions: matched,
-            unresolvedSubscriptions: sourceFeeds.count - matched,
+            unresolvedSubscriptions: bundle.subscriptions.count - matched,
             statefulEpisodes: statefulEpisodes,
             downloadedEpisodes: bundle.episodes.filter(\.downloadRequested).count,
             requiredRefreshes: Set(bundle.episodes.map(\.sourcePodcastId)).count,
@@ -339,7 +438,7 @@ enum OvercastMigration {
             }
         }
 
-        var episodesByPodcastId = [Int64: [Episode]]()
+        var episodesByPodcastId = [Int64: [PocketCastsDataModel.Episode]]()
         for podcast in Set(podcastsBySourceId.values) {
             episodesByPodcastId[podcast.id] = dataManager.findEpisodesWhere(
                 customWhere: "podcast_id = ?",
@@ -405,12 +504,15 @@ enum OvercastMigration {
             podcasts.compactMap { podcast in canonicalFeedURL(podcast.podcastUrl).map { ($0, podcast) } },
             uniquingKeysWith: { first, _ in first }
         )
-        let sourcePodcastById = Dictionary(uniqueKeysWithValues: bundle.subscriptions.compactMap { subscription in
-            guard let feed = canonicalFeedURL(subscription.feedURL),
-                  let podcast = destinationByFeed[feed]
-            else { return nil }
-            return (subscription.sourcePodcastId, podcast)
-        })
+        let sourcePodcastById: [Int64: Podcast] = Dictionary(
+            bundle.subscriptions.compactMap { subscription -> (Int64, Podcast)? in
+                guard let feed = canonicalFeedURL(subscription.feedURL),
+                      let podcast = destinationByFeed[feed]
+                else { return nil }
+                return (subscription.sourcePodcastId, podcast)
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
         var destinationEpisodes = [Int64: [PocketCastsDataModel.Episode]]()
         for podcast in sourcePodcastById.values {
             destinationEpisodes[podcast.id] = dataManager.findEpisodesWhere(
@@ -466,12 +568,15 @@ enum OvercastMigration {
             podcasts.compactMap { podcast in canonicalFeedURL(podcast.podcastUrl).map { ($0, podcast) } },
             uniquingKeysWith: { first, _ in first }
         )
-        let sourcePodcastById = Dictionary(uniqueKeysWithValues: bundle.subscriptions.compactMap { subscription in
-            guard let feed = canonicalFeedURL(subscription.feedURL),
-                  let podcast = destinationByFeed[feed]
-            else { return nil }
-            return (subscription.sourcePodcastId, podcast)
-        })
+        let sourcePodcastById: [Int64: Podcast] = Dictionary(
+            bundle.subscriptions.compactMap { subscription -> (Int64, Podcast)? in
+                guard let feed = canonicalFeedURL(subscription.feedURL),
+                      let podcast = destinationByFeed[feed]
+                else { return nil }
+                return (subscription.sourcePodcastId, podcast)
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
         var destinationEpisodes = [Int64: [PocketCastsDataModel.Episode]]()
         for podcast in sourcePodcastById.values {
             destinationEpisodes[podcast.id] = dataManager.findEpisodesWhere(
@@ -590,5 +695,24 @@ enum OvercastMigration {
             case .testOnlyBundle: "A test-only migration bundle cannot be imported."
             }
         }
+    }
+}
+
+private extension KeyedDecodingContainer {
+    func decodeSQLiteBooleanIfPresent(forKey key: Key) throws -> Bool? {
+        guard contains(key), try !decodeNil(forKey: key) else { return nil }
+        if let value = try? decode(Bool.self, forKey: key) {
+            return value
+        }
+        if let value = try? decode(Int.self, forKey: key) {
+            return value != 0
+        }
+        throw DecodingError.typeMismatch(
+            Bool.self,
+            DecodingError.Context(
+                codingPath: codingPath + [key],
+                debugDescription: "Expected a JSON boolean or SQLite 0/1 integer."
+            )
+        )
     }
 }
