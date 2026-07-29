@@ -49,6 +49,39 @@ enum OvercastMigration {
         }
     }
 
+    struct ShowSetting: Decodable {
+        let sourcePodcastId: Int64
+        let feedURL: String?
+        let itemLimit: Int
+        let playbackSpeedId: Int64
+        let downloadPolicy: Int
+        let metadata: String?
+
+        enum CodingKeys: String, CodingKey {
+            case metadata
+            case sourcePodcastId = "id"
+            case feedURL = "feed_url"
+            case itemLimit = "item_limit"
+            case playbackSpeedId = "playback_speed_id"
+            case downloadPolicy = "download_policy"
+        }
+
+        var playbackSpeed: Double? {
+            guard playbackSpeedId != 0 else { return nil }
+            let encoded = playbackSpeedId & 0x3FFF_FFFF
+            let speed = (Double(encoded) / 1000 * 20).rounded() / 20
+            return (0.5 ... 5).contains(speed) ? speed : nil
+        }
+
+        var skipTimes: (intro: Int, outro: Int) {
+            guard let metadata,
+                  let data = metadata.data(using: .utf8),
+                  let values = try? JSONDecoder().decode([String: Int].self, from: data)
+            else { return (0, 0) }
+            return (max(0, values["si"] ?? 0), max(0, values["so"] ?? 0))
+        }
+    }
+
     struct Episode: Decodable {
         enum PlaybackState: String, Decodable {
             case notStarted = "not_started"
@@ -115,6 +148,7 @@ enum OvercastMigration {
         let manifest: Manifest
         let subscriptions: [Subscription]
         let episodes: [Episode]
+        let showSettings: [ShowSetting]
 
         static func load(from directory: URL) throws -> Self {
             let manifest: Manifest = try decode("manifest.json", in: directory)
@@ -130,7 +164,8 @@ enum OvercastMigration {
             return Self(
                 manifest: manifest,
                 subscriptions: try decode("subscriptions.json", in: directory),
-                episodes: try decode("episodes.json", in: directory)
+                episodes: try decode("episodes.json", in: directory),
+                showSettings: try decode("show_settings.json", in: directory)
             )
         }
 
@@ -162,6 +197,7 @@ enum OvercastMigration {
         var ignoredOvercastDeletionMarkers = 0
         var restoredStars = 0
         var queuedRedownloads = 0
+        var restoredShowSettings = 0
     }
 
     static func dryRun(bundle: Bundle, podcasts: [Podcast]) -> DryRun {
@@ -209,6 +245,37 @@ enum OvercastMigration {
             }
             podcastsBySourceId[subscription.sourcePodcastId] = podcast
             report.matchedSubscriptions += 1
+        }
+
+        for setting in bundle.showSettings {
+            guard let podcast = podcastsBySourceId[setting.sourcePodcastId] else { continue }
+            let skips = setting.skipTimes
+            var changed = false
+            if let speed = setting.playbackSpeed {
+                podcast.playbackSpeed = speed
+                changed = true
+            }
+            if skips.intro > 0 {
+                podcast.startFrom = Int32(clamping: skips.intro)
+                changed = true
+            }
+            if skips.outro > 0 {
+                podcast.skipLast = Int32(clamping: skips.outro)
+                changed = true
+            }
+            if setting.downloadPolicy != 0 {
+                podcast.autoDownloadSetting = AutoDownloadSetting.latest.rawValue
+                changed = true
+            }
+            if setting.itemLimit > 0 {
+                podcast.autoArchiveEpisodeLimit = Int32(clamping: setting.itemLimit)
+                changed = true
+            }
+            if changed {
+                podcast.syncStatus = SyncStatus.notSynced.rawValue
+                dataManager.save(podcast: podcast)
+                report.restoredShowSettings += 1
+            }
         }
 
         var episodesByPodcastId = [Int64: [Episode]]()

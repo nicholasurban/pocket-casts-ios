@@ -147,6 +147,7 @@ struct DeveloperMenu: View {
                             Unresolved episode records: \(report.unresolvedEpisodes)
                             Playback states restored: \(report.restoredPlaybackStates)
                             Stars restored: \(report.restoredStars)
+                            Show settings restored: \(report.restoredShowSettings)
                             Overcast removal markers ignored: \(report.ignoredOvercastDeletionMarkers)
                             Downloads queued: \(report.queuedRedownloads)
                             """
