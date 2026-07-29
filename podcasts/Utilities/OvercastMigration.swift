@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import PocketCastsDataModel
 
@@ -165,12 +166,27 @@ enum OvercastMigration {
         }
     }
 
+    struct AudioRecord: Decodable {
+        let sourceEpisodeId: Int64
+        let present: Bool
+        let relativePath: String?
+        let sha256: String?
+
+        enum CodingKeys: String, CodingKey {
+            case present, sha256
+            case sourceEpisodeId = "source_episode_id"
+            case relativePath = "relative_path"
+        }
+    }
+
     struct Bundle {
         let manifest: Manifest
         let subscriptions: [Subscription]
         let episodes: [Episode]
         let showSettings: [ShowSetting]
         let playlists: [Playlist]
+        let audioRecords: [AudioRecord]
+        let directory: URL
 
         static func load(from directory: URL) throws -> Self {
             let manifest: Manifest = try decode("manifest.json", in: directory)
@@ -188,7 +204,9 @@ enum OvercastMigration {
                 subscriptions: try decode("subscriptions.json", in: directory),
                 episodes: try decode("episodes.json", in: directory),
                 showSettings: try decode("show_settings.json", in: directory),
-                playlists: try decode("playlists.json", in: directory)
+                playlists: try decode("playlists.json", in: directory),
+                audioRecords: try decode("downloaded-audio-inventory.json", in: directory),
+                directory: directory
             )
         }
 
@@ -224,6 +242,8 @@ enum OvercastMigration {
         var restoredQueueEpisodes = 0
         var restoredPlaylists = 0
         var unresolvedCollectionEpisodes = 0
+        var importedAudioFiles = 0
+        var unresolvedAudioFiles = 0
     }
 
     static func dryRun(bundle: Bundle, podcasts: [Podcast]) -> DryRun {
@@ -343,6 +363,67 @@ enum OvercastMigration {
             }
         }
         return report
+    }
+
+    static func restorePreservedAudio(
+        bundle: Bundle,
+        podcasts: [Podcast],
+        dataManager: DataManager = .sharedManager,
+        downloadManager: DownloadManager = .shared
+    ) -> Reconciliation {
+        var report = Reconciliation()
+        let destinationByFeed = Dictionary(
+            podcasts.compactMap { podcast in canonicalFeedURL(podcast.podcastUrl).map { ($0, podcast) } },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let sourcePodcastById = Dictionary(uniqueKeysWithValues: bundle.subscriptions.compactMap { subscription in
+            guard let feed = canonicalFeedURL(subscription.feedURL),
+                  let podcast = destinationByFeed[feed]
+            else { return nil }
+            return (subscription.sourcePodcastId, podcast)
+        })
+        var destinationEpisodes = [Int64: [PocketCastsDataModel.Episode]]()
+        for podcast in sourcePodcastById.values {
+            destinationEpisodes[podcast.id] = dataManager.findEpisodesWhere(
+                customWhere: "podcast_id = ?",
+                arguments: [podcast.id]
+            )
+        }
+        let sourceEpisodes = Dictionary(uniqueKeysWithValues: bundle.episodes.map { ($0.sourceEpisodeId, $0) })
+
+        for audio in bundle.audioRecords where audio.present {
+            guard let relativePath = audio.relativePath,
+                  let expectedHash = audio.sha256,
+                  let source = sourceEpisodes[audio.sourceEpisodeId],
+                  let podcast = sourcePodcastById[source.sourcePodcastId],
+                  let destination = matchingEpisode(source, in: destinationEpisodes[podcast.id] ?? [])
+            else {
+                report.unresolvedAudioFiles += 1
+                continue
+            }
+            let sourceFile = bundle.directory.appendingPathComponent(relativePath)
+            guard fileSHA256(sourceFile) == expectedHash else {
+                report.unresolvedAudioFiles += 1
+                continue
+            }
+            downloadManager.processEpisode(destination, downloadedFile: sourceFile, reportedContentType: nil, copyFile: true)
+            if destination.downloaded(pathFinder: downloadManager) {
+                report.importedAudioFiles += 1
+            } else {
+                report.unresolvedAudioFiles += 1
+            }
+        }
+        return report
+    }
+
+    private static func fileSHA256(_ file: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { try? handle.close() }
+        var digest = SHA256()
+        while let data = try? handle.read(upToCount: 1024 * 1024), !data.isEmpty {
+            digest.update(data: data)
+        }
+        return digest.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     static func restoreCollections(
