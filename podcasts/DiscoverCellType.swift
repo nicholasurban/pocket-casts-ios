@@ -101,6 +101,9 @@ extension DiscoverItem {
             return .largeListWithPodcast
         default:
             FileLog.shared.addMessage("Unknown Discover Item: \(type ?? "unknown") \(summaryStyle ?? "unknown")")
+            if ProcessInfo.processInfo.arguments.contains(OvercastMigration.fullQALaunchArgument) {
+                return nil
+            }
             assertionFailure("Unknown Discover Item: \(type ?? "unknown") \(summaryStyle ?? "unknown")")
             return nil
         }
