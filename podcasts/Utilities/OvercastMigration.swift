@@ -99,6 +99,7 @@ enum OvercastMigration {
         let enclosureURL: String
         let advertisedDuration: Int
         let progressSeconds: Int
+        let lastPlayedTime: Int64
         /// This is Overcast's raw `userDeleted` flag. It is intentionally not
         /// treated as Pocket Casts archive state: in the inspected source it
         /// marks most historical feed entries, so applying it would hide a
@@ -118,6 +119,7 @@ enum OvercastMigration {
             case enclosureURL = "enclosure_url"
             case advertisedDuration = "advertised_duration"
             case progressSeconds = "progress_seconds"
+            case lastPlayedTime = "last_played_time"
             case starredTime = "starred_time"
             case downloadRequested = "download_requested"
             case playbackState = "playback_state"
@@ -135,6 +137,7 @@ enum OvercastMigration {
             enclosureURL = try container.decode(String.self, forKey: .enclosureURL)
             advertisedDuration = try container.decode(Int.self, forKey: .advertisedDuration)
             progressSeconds = try container.decode(Int.self, forKey: .progressSeconds)
+            lastPlayedTime = try container.decodeIfPresent(Int64.self, forKey: .lastPlayedTime) ?? 0
             // Bundles made before the field was clarified used `archived`.
             overcastDeleted = try container.decodeIfPresent(Bool.self, forKey: .overcastDeleted)
                 ?? container.decodeIfPresent(Bool.self, forKey: .archived)
@@ -179,6 +182,14 @@ enum OvercastMigration {
         }
     }
 
+    struct PlaybackState: Decodable {
+        let currentSourceEpisodeId: Int64?
+
+        enum CodingKeys: String, CodingKey {
+            case currentSourceEpisodeId = "current_source_episode_id"
+        }
+    }
+
     struct Bundle {
         let manifest: Manifest
         let subscriptions: [Subscription]
@@ -187,6 +198,7 @@ enum OvercastMigration {
         let playlists: [Playlist]
         let audioRecords: [AudioRecord]
         let directory: URL
+        let playbackState: PlaybackState
 
         static func load(from directory: URL) throws -> Self {
             let manifest: Manifest = try decode("manifest.json", in: directory)
@@ -206,7 +218,8 @@ enum OvercastMigration {
                 showSettings: try decode("show_settings.json", in: directory),
                 playlists: try decode("playlists.json", in: directory),
                 audioRecords: try decode("downloaded-audio-inventory.json", in: directory),
-                directory: directory
+                directory: directory,
+                playbackState: try decode("playback_state.json", in: directory)
             )
         }
 
@@ -244,6 +257,8 @@ enum OvercastMigration {
         var unresolvedCollectionEpisodes = 0
         var importedAudioFiles = 0
         var unresolvedAudioFiles = 0
+        var restoredHistoryDates = 0
+        var restoredCurrentEpisode = false
     }
 
     static func dryRun(bundle: Bundle, podcasts: [Podcast]) -> DryRun {
@@ -350,6 +365,13 @@ enum OvercastMigration {
                 )
                 report.restoredPlaybackStates += 1
             }
+            if source.lastPlayedTime > 0 {
+                destination.lastPlaybackInteractionDate = Date(
+                    timeIntervalSince1970: TimeInterval(source.lastPlayedTime)
+                )
+                dataManager.save(episode: destination)
+                report.restoredHistoryDates += 1
+            }
             if source.overcastDeleted {
                 report.ignoredOvercastDeletionMarkers += 1
             }
@@ -361,6 +383,13 @@ enum OvercastMigration {
                 downloadManager.addToQueue(episodeUuid: destination.uuid, fireNotification: false, autoDownloadStatus: .notSpecified)
                 report.queuedRedownloads += 1
             }
+        }
+        if let currentId = bundle.playbackState.currentSourceEpisodeId,
+           let source = bundle.episodes.first(where: { $0.sourceEpisodeId == currentId }),
+           let podcast = podcastsBySourceId[source.sourcePodcastId],
+           let current = matchingEpisode(source, in: episodesByPodcastId[podcast.id] ?? []) {
+            PlaybackManager.shared.load(episode: current, autoPlay: false, overrideUpNext: false)
+            report.restoredCurrentEpisode = true
         }
         return report
     }

@@ -148,6 +148,8 @@ struct DeveloperMenu: View {
                             Matched episodes: \(report.matchedEpisodes)
                             Unresolved episode records: \(report.unresolvedEpisodes)
                             Playback states restored: \(report.restoredPlaybackStates)
+                            Listening-history dates restored: \(report.restoredHistoryDates)
+                            Current episode restored: \(report.restoredCurrentEpisode)
                             Stars restored: \(report.restoredStars)
                             Show settings restored: \(report.restoredShowSettings)
                             Overcast removal markers ignored: \(report.ignoredOvercastDeletionMarkers)

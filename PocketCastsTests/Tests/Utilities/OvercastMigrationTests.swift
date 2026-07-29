@@ -18,6 +18,7 @@ final class OvercastMigrationTests: XCTestCase {
         try write("[]", named: "show_settings.json", in: directory)
         try write("[]", named: "playlists.json", in: directory)
         try write("[]", named: "downloaded-audio-inventory.json", in: directory)
+        try write("{\"current_source_episode_id\":null,\"sessions\":[]}", named: "playback_state.json", in: directory)
 
         let bundle = try OvercastMigration.Bundle.load(from: directory)
         let plan = OvercastMigration.dryRun(bundle: bundle, podcasts: [])
@@ -40,6 +41,7 @@ final class OvercastMigrationTests: XCTestCase {
         try write("[]", named: "show_settings.json", in: directory)
         try write("[]", named: "playlists.json", in: directory)
         try write("[]", named: "downloaded-audio-inventory.json", in: directory)
+        try write("{\"current_source_episode_id\":null,\"sessions\":[]}", named: "playback_state.json", in: directory)
 
         let opml = try OvercastMigration.writeOPML(bundle: try .load(from: directory))
         defer { try? FileManager.default.removeItem(at: opml) }
