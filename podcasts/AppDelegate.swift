@@ -135,11 +135,38 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         }
 
         #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains(OvercastMigration.fullQALaunchArgument) {
+        let migrationArguments = ProcessInfo.processInfo.arguments
+        let requestedMigrationMode: OvercastMigrationRunner.Mode? =
+            migrationArguments.contains(OvercastMigration.fullProductionLaunchArgument) ? .production
+            : migrationArguments.contains(OvercastMigration.fullQALaunchArgument) ? .rehearsal
+            : nil
+
+        if let mode = requestedMigrationMode {
             let runner = OvercastMigrationRunner()
             overcastMigrationQARunner = runner
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                runner.runInstalled(mode: .rehearsal)
+            Task { @MainActor in
+                // Sign in first when credentials are supplied. A production run
+                // that starts signed out would import locally and then sync
+                // nothing, which looks identical to success in the report.
+                do {
+                    switch try await OvercastMigration.signInFromEnvironmentIfNeeded() {
+                    case .notRequested:
+                        if !mode.isRehearsal {
+                            print("Overcast migration ABORTED: production mode requires \(OvercastMigration.accountEmailEnvironmentKey) and \(OvercastMigration.accountPasswordEnvironmentKey)")
+                            return
+                        }
+                    case .alreadySignedIn(let email):
+                        print("Overcast migration signed in already as \(email)")
+                    case .signedIn(let email):
+                        print("Overcast migration signed in as \(email)")
+                    }
+                } catch {
+                    print("Overcast migration ABORTED: sign-in failed: \(error.localizedDescription)")
+                    return
+                }
+
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                runner.runInstalled(mode: mode)
             }
         } else if OvercastMigration.shouldRunInstalledPreflightRehearsal() {
             DispatchQueue.global(qos: .userInitiated).async {

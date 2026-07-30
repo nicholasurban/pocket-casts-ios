@@ -12,9 +12,53 @@ enum OvercastMigration {
     static let supportedFormatVersion = 1
     static let qaLaunchArgument = "--overcast-migration-qa"
     static let fullQALaunchArgument = "--overcast-migration-full-qa"
+    /// Runs the same complete runner as `fullQALaunchArgument` but in
+    /// production mode, so every preserved audio file is imported rather than
+    /// the single proof-of-path file used during rehearsal.
+    static let fullProductionLaunchArgument = "--overcast-migration-full-production"
     static let qaBundleDirectoryName = "OvercastMigrationQA"
     static let qaMarkerFileName = "OvercastMigrationQA.run"
     static let qaReceiptFileName = "OvercastMigrationQAReceipt.json"
+
+    /// Environment variables used to sign the simulator into a Pocket Casts
+    /// account without driving the sign-in UI. They are read from the process
+    /// environment (set by `simctl` with the `SIMCTL_CHILD_` prefix) so the
+    /// password never appears in a launch argument or in this repository.
+    static let accountEmailEnvironmentKey = "OVERCAST_MIGRATION_PC_EMAIL"
+    static let accountPasswordEnvironmentKey = "OVERCAST_MIGRATION_PC_PASSWORD"
+
+    enum SignInOutcome {
+        /// No credentials were supplied; the caller should proceed offline.
+        case notRequested
+        /// The account was already signed in before this launch.
+        case alreadySignedIn(String)
+        case signedIn(String)
+    }
+
+    /// Signs in from the environment when credentials are present.
+    ///
+    /// The migration writes local rows flagged `notSynced` and then asks Pocket
+    /// Casts to sync. Without an authenticated account that final step is a
+    /// silent no-op, so the run must fail loudly here rather than appear to
+    /// succeed and upload nothing.
+    static func signInFromEnvironmentIfNeeded() async throws -> SignInOutcome {
+        let environment = ProcessInfo.processInfo.environment
+        guard
+            let email = environment[accountEmailEnvironmentKey]?.trimmingCharacters(in: .whitespacesAndNewlines),
+            let password = environment[accountPasswordEnvironmentKey],
+            !email.isEmpty,
+            !password.isEmpty
+        else {
+            return .notRequested
+        }
+
+        if SyncManager.isUserLoggedIn(), let existing = ServerSettings.syncingEmail(), existing == email {
+            return .alreadySignedIn(existing)
+        }
+
+        _ = try await AuthenticationHelper.validateLogin(username: email, password: password)
+        return .signedIn(email)
+    }
 
     struct Manifest: Decodable {
         let format: String
@@ -1463,7 +1507,16 @@ final class OvercastMigrationRunner: ObservableObject {
     }
 
     @Published private(set) var isRunning = false
-    @Published private(set) var status = "Ready"
+    /// Every transition is echoed to stdout. The migration is normally driven
+    /// unattended from `scripts/overcast-migration-run.sh`, where a status
+    /// string that only reaches the developer UI is indistinguishable from a
+    /// hang. `[overcast-migration]` is the greppable prefix.
+    @Published private(set) var status = "Ready" {
+        didSet {
+            guard status != oldValue else { return }
+            print("[overcast-migration] \(status)")
+        }
+    }
     @Published private(set) var backupURL: URL?
     @Published private(set) var reportURL: URL?
 
@@ -1577,23 +1630,7 @@ final class OvercastMigrationRunner: ObservableObject {
                 try? FileManager.default.removeItem(at: temporaryReport)
                 DispatchQueue.main.async { [weak self] in
                     self?.reportURL = reportURL
-                    self?.status = "Synchronizing and refreshing Pocket Casts"
-                    RefreshManager.shared.refreshPodcasts { result in
-                        DispatchQueue.main.async { [weak self] in
-                            switch result {
-                            case .newData, .noData:
-                                self?.auditAndComplete(
-                                    bundle: bundle,
-                                    mode: mode,
-                                    report: report
-                                )
-                            case .failed:
-                                self?.fail(
-                                    "Local import finished, but the final Pocket Casts refresh/sync failed. The reconciliation report was preserved."
-                                )
-                            }
-                        }
-                    }
+                    self?.drainSyncQueue(bundle: bundle, mode: mode, report: report, pass: 1)
                 }
             } catch {
                 DispatchQueue.main.async { [weak self] in
@@ -1602,6 +1639,67 @@ final class OvercastMigrationRunner: ObservableObject {
             }
         }
     }
+
+    /// Repeatedly synchronizes until Pocket Casts has nothing left to upload.
+    ///
+    /// A sync pass sends at most `ServerConstants.Limits.maxEpisodesToSync`
+    /// episodes (2000 on iOS), and listening history is capped separately at
+    /// 100 items per pass. A migration modifies roughly ten thousand episodes,
+    /// so a single pass uploads a fraction of it and returns success. Every
+    /// local number then looks perfect while most of the library never reaches
+    /// the account — which is exactly what the 2026-07-30 probe measured.
+    private func drainSyncQueue(
+        bundle: OvercastMigration.Bundle,
+        mode: Mode,
+        report: OvercastMigration.Reconciliation,
+        pass: Int
+    ) {
+        let remaining = DataManager.sharedManager.unsyncedEpisodes(limit: Self.syncDrainProbeLimit).count
+        if remaining == 0, pass > 1 {
+            status = "Upload queue drained after \(pass - 1) sync passes"
+            auditAndComplete(bundle: bundle, mode: mode, report: report)
+            return
+        }
+
+        guard pass <= Self.maximumSyncPasses else {
+            // Report rather than silently accept a partial upload; the
+            // reconciliation report and the local database are both intact, so
+            // this is recoverable by syncing again rather than re-importing.
+            fail("Upload did not finish: \(remaining)+ episodes still queued after \(Self.maximumSyncPasses) sync passes.")
+            return
+        }
+
+        status = "Synchronizing Pocket Casts (pass \(pass), \(remaining)+ episodes queued)"
+        RefreshManager.shared.refreshPodcasts { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .newData, .noData:
+                    // Give the sync task time to finish writing its results
+                    // before counting what is left.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Self.syncPassInterval) {
+                        self.drainSyncQueue(
+                            bundle: bundle,
+                            mode: mode,
+                            report: report,
+                            pass: pass + 1
+                        )
+                    }
+                case .failed:
+                    self.fail(
+                        "Local import finished, but Pocket Casts refresh/sync failed on pass \(pass). The reconciliation report was preserved."
+                    )
+                }
+            }
+        }
+    }
+
+    /// Enough passes to clear a full migration at 2000 episodes per pass, with
+    /// generous headroom for history's much smaller per-pass cap.
+    private static let maximumSyncPasses = 250
+    private static let syncPassInterval: TimeInterval = 5
+    /// Only ever asked whether work remains, so one row is enough.
+    private static let syncDrainProbeLimit = 1
 
     private func auditAndComplete(
         bundle: OvercastMigration.Bundle,
@@ -1655,6 +1753,7 @@ final class OvercastMigrationRunner: ObservableObject {
     }
 
     private func fail(_ message: String) {
+        print("[overcast-migration] FAILED: \(message)")
         status = "Failed: \(message)"
         isRunning = false
         removeObservers()

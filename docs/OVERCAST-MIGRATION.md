@@ -35,6 +35,22 @@ The exporter derives an episode's last interaction date from the newest
 non-deleted `OCPlaybackSession` row when available. The complete session ledger
 is also retained in `playback_state.json`.
 
+## Deciding when the source has settled
+
+The export must not run while episodes are still being deleted on the phone or
+while Overcast is still syncing. `scripts/overcast-source-stability.py` samples
+the live database read-only and reports `STABLE` only when every counter, the
+WAL size and the database modification time hold still across the whole window:
+
+```bash
+python3 scripts/overcast-source-stability.py --samples 3 --interval 60
+```
+
+Exit status is 0 when stable, 1 when the source is still moving, 2 when the
+database cannot be inspected. The shared-memory file's modification time is
+deliberately ignored, because opening the database read-only rewrites it and
+would otherwise report drift we caused ourselves.
+
 ## Export
 
 Run the exporter against a fully synchronized, closed Overcast Mac app:
@@ -151,3 +167,48 @@ Immediately before production:
 4. import once and allow Pocket Casts sync to finish;
 5. compare the final reconciliation report with the source manifest;
 6. keep Overcast and the neutral bundle untouched for several weeks.
+
+## The account is what carries the migration, not the device
+
+The importer writes local rows flagged `notSynced` and then asks Pocket Casts
+to sync. That means the migration does not have to happen on the destination
+phone at all: a simulator signed into the account uploads the state, and every
+other device pulls it down normally. Only downloaded audio is device-local and
+does not travel this way.
+
+It also means a run that starts signed out imports locally and then uploads
+nothing, while still producing a healthy-looking reconciliation report. The
+production launch path therefore refuses to start without credentials.
+
+Credentials are supplied through the environment, never through launch
+arguments or this repository:
+
+| Variable | Purpose |
+|---|---|
+| `OVERCAST_MIGRATION_PC_EMAIL` | Pocket Casts account email |
+| `OVERCAST_MIGRATION_PC_PASSWORD` | Pocket Casts account password |
+
+`simctl` forwards them with its `SIMCTL_CHILD_` prefix. Launch arguments:
+
+| Argument | Mode |
+|---|---|
+| `--overcast-migration-full-qa` | rehearsal; imports one proof-of-path audio file |
+| `--overcast-migration-full-production` | production; imports all preserved audio, requires credentials |
+
+## Running the whole thing
+
+`scripts/overcast-migration-run.sh` is the single entry point. It checks source
+stability, exports a fresh bundle, builds and installs the migration app on a
+clean simulator, signs in, runs the importer, and then reads the sync server
+back to prove the upload happened:
+
+```bash
+scripts/overcast-migration-run.sh probe        # partial bundle, proves sync works
+scripts/overcast-migration-run.sh production   # the real migration
+```
+
+Evidence for each run lands in `~/Documents/Overcast Migration Runs/<mode>-<timestamp>/`.
+
+`scripts/pocketcasts-account-audit.py` reads the account from the sync server
+on its own. A local reconciliation report describes the simulator's database;
+only the server audit shows what actually reached the account.

@@ -202,6 +202,15 @@ final class OvercastMigrationTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: directory.path) else {
             throw XCTSkip("Install a real bundle as Documents/OvercastMigrationQA for disposable simulator rehearsal.")
         }
+        // This test asserts on verified artifact checksums, so the fixture has
+        // to be a current-format bundle. Bundles exported before the checksum
+        // manifest existed would otherwise fail here as though the importer
+        // had regressed, when the fixture is simply out of date.
+        guard FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent("artifact-checksums.json").path
+        ) else {
+            throw XCTSkip("Installed bundle predates artifact-checksums.json; re-export it before rehearsing.")
+        }
 
         let bundle = try OvercastMigration.Bundle.load(from: directory)
         let receiptURL = try OvercastMigration.runInstalledPreflightRehearsal()
