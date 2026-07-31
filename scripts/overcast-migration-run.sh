@@ -84,9 +84,21 @@ echo "Account: $PC_EMAIL"
 # ------------------------------------------------------------------ stability
 if [[ "$SKIP_STABILITY" -eq 0 ]]; then
     log "Checking the Overcast database has settled"
-    python3 scripts/overcast-source-stability.py "$OVERCAST_DB" \
+    # A source still in motion means Nick is mid-deletion or Overcast is still
+    # syncing, which is a reason to wait rather than to abandon a scheduled
+    # run. Retry until it settles; only give up after the whole window.
+    STABILITY_ATTEMPT=1
+    until python3 scripts/overcast-source-stability.py "$OVERCAST_DB" \
         --samples "$STABILITY_SAMPLES" --interval "$STABILITY_INTERVAL" \
-        --json "$RUN_DIR/source-stability.json"
+        --json "$RUN_DIR/source-stability.json"; do
+        if (( STABILITY_ATTEMPT >= ${STABILITY_RETRIES:-12} )); then
+            echo "source still changing after ${STABILITY_RETRIES:-12} attempts; not exporting" >&2
+            exit 1
+        fi
+        echo "  still changing; waiting ${STABILITY_RETRY_WAIT:-300}s (attempt $STABILITY_ATTEMPT)"
+        sleep "${STABILITY_RETRY_WAIT:-300}"
+        STABILITY_ATTEMPT=$(( STABILITY_ATTEMPT + 1 ))
+    done
 else
     echo "(stability check skipped)"
 fi
@@ -184,6 +196,30 @@ SIMCTL_CHILD_OVERCAST_MIGRATION_PC_PASSWORD="$PC_PASSWORD" \
     xcrun simctl launch --console-pty "$UDID" "$BUNDLE_ID" "$LAUNCH_ARG" \
     > "$RUN_DIR/app-console.log" 2>&1 &
 LAUNCH_PID=$!
+
+# Memory ceiling. On 2026-07-30 the importer held every episode of every show
+# in memory at once, reached 16 GB, and took the whole machine down with it.
+# The leak is fixed, but no migration run should ever again be able to do that,
+# whatever the cause — so watch the simulated app's resident size and kill the
+# run if it crosses the limit.
+MEMORY_LIMIT_MB="${MEMORY_LIMIT_MB:-4096}"
+(
+    while sleep 20; do
+        APP_PID="$(pgrep -f 'podcasts.app/podcasts' | head -1)"
+        [[ -z "$APP_PID" ]] && continue
+        RSS_MB=$(( $(ps -o rss= -p "$APP_PID" 2>/dev/null || echo 0) / 1024 ))
+        if (( RSS_MB > MEMORY_LIMIT_MB )); then
+            echo "[memory-guard] podcasts reached ${RSS_MB}MB (limit ${MEMORY_LIMIT_MB}MB); killing the run" \
+                | tee -a "$RUN_DIR/memory-guard.log" >&2
+            kill -9 "$APP_PID" 2>/dev/null
+            kill "$LAUNCH_PID" 2>/dev/null
+            exit 1
+        fi
+        echo "$(date -u +%H:%M:%S) ${RSS_MB}MB" >> "$RUN_DIR/memory.log"
+    done
+) &
+MEMORY_GUARD_PID=$!
+trap 'kill "$MEMORY_GUARD_PID" 2>/dev/null || true' EXIT
 
 REPORT="$CONTAINER/Documents/OvercastMigrationQACompleteReport.txt"
 log "Waiting for the reconciliation report"

@@ -376,7 +376,16 @@ enum OvercastMigration {
 
     private struct PodcastReconciliation {
         let podcastsBySourceId: [Int64: Podcast]
-        let episodesByPodcastId: [Int64: [PocketCastsDataModel.Episode]]
+        /// Loads one show's destination episodes on demand.
+        ///
+        /// This used to be a `[Int64: [Episode]]` holding every episode of
+        /// every show at once. At Nick's library size that is ~101,500 episode
+        /// objects, each carrying `showNotes`, `episodeDescription` and
+        /// `detailedDescription` — full HTML, routinely tens of kilobytes
+        /// apiece. Together with the source side it drove the process past
+        /// 16 GB and took the machine down on 2026-07-30. Loading per show
+        /// caps the peak at a single podcast's episodes.
+        let loadEpisodes: (Int64) -> [PocketCastsDataModel.Episode]
     }
 
     /// Pocket Casts' `podcastUrl` is the show's website, not its RSS feed.
@@ -388,16 +397,19 @@ enum OvercastMigration {
         podcasts: [Podcast],
         dataManager: DataManager
     ) -> PodcastReconciliation {
-        var episodesByPodcastId = [Int64: [PocketCastsDataModel.Episode]]()
+        // Build only the enclosure index here. Each show's episodes are read,
+        // reduced to their download URLs, and released before the next show is
+        // read, so peak memory is one podcast rather than the whole library.
         var destinationIdsByEnclosure = [String: Set<Int64>]()
         for podcast in podcasts {
-            let episodes = dataManager.findEpisodesWhere(
-                customWhere: "podcast_id = ?",
-                arguments: [podcast.id]
-            )
-            episodesByPodcastId[podcast.id] = episodes
-            for enclosure in episodes.compactMap(\.downloadUrl) where !enclosure.isEmpty {
-                destinationIdsByEnclosure[enclosure, default: []].insert(podcast.id)
+            autoreleasepool {
+                let episodes = dataManager.findEpisodesWhere(
+                    customWhere: "podcast_id = ?",
+                    arguments: [podcast.id]
+                )
+                for enclosure in episodes.compactMap(\.downloadUrl) where !enclosure.isEmpty {
+                    destinationIdsByEnclosure[enclosure, default: []].insert(podcast.id)
+                }
             }
         }
 
@@ -450,8 +462,38 @@ enum OvercastMigration {
         }
         return PodcastReconciliation(
             podcastsBySourceId: result,
-            episodesByPodcastId: episodesByPodcastId
+            loadEpisodes: { podcastId in
+                dataManager.findEpisodesWhere(
+                    customWhere: "podcast_id = ?",
+                    arguments: [podcastId]
+                )
+            }
         )
+    }
+
+    /// Holds one show's destination episodes at a time.
+    ///
+    /// The exporter orders episodes by podcast, so callers walking the source
+    /// bundle ask for the same show many times in a row. A single-entry cache
+    /// therefore serves almost every lookup without re-querying, while never
+    /// holding more than one podcast's episodes in memory.
+    final class DestinationEpisodeCache {
+        private let load: (Int64) -> [PocketCastsDataModel.Episode]
+        private var cachedPodcastId: Int64?
+        private var cachedEpisodes: [PocketCastsDataModel.Episode] = []
+
+        init(load: @escaping (Int64) -> [PocketCastsDataModel.Episode]) {
+            self.load = load
+        }
+
+        func episodes(for podcastId: Int64) -> [PocketCastsDataModel.Episode] {
+            if cachedPodcastId == podcastId {
+                return cachedEpisodes
+            }
+            cachedEpisodes = load(podcastId)
+            cachedPodcastId = podcastId
+            return cachedEpisodes
+        }
     }
 
     private static func normalizedTitle(_ value: String?) -> String {
@@ -837,7 +879,7 @@ enum OvercastMigration {
             }
         }
 
-        let episodesByPodcastId = reconciliation.episodesByPodcastId
+        let episodesByPodcastId = DestinationEpisodeCache(load: reconciliation.loadEpisodes)
 
         for source in bundle.episodes where shouldRestore(source, restoreDownloads: restoreDownloads) {
             guard let podcast = podcastsBySourceId[source.sourcePodcastId] else {
@@ -847,7 +889,7 @@ enum OvercastMigration {
                 )
                 continue
             }
-            let match = episodeMatch(source, in: episodesByPodcastId[podcast.id] ?? [])
+            let match = episodeMatch(source, in: episodesByPodcastId.episodes(for: podcast.id))
             guard let destination = match.episode else {
                 report.unresolvedEpisodes += 1
                 report.unresolvedRecords.append(
@@ -888,7 +930,7 @@ enum OvercastMigration {
         if let currentId = bundle.playbackState.currentSourceEpisodeId,
            let source = bundle.episodes.first(where: { $0.sourceEpisodeId == currentId }),
            let podcast = podcastsBySourceId[source.sourcePodcastId],
-           let current = matchingEpisode(source, in: episodesByPodcastId[podcast.id] ?? []) {
+           let current = matchingEpisode(source, in: episodesByPodcastId.episodes(for: podcast.id)) {
             PlaybackManager.shared.load(episode: current, autoPlay: false, overrideUpNext: false)
             report.restoredCurrentEpisode = true
         }
@@ -909,7 +951,7 @@ enum OvercastMigration {
             dataManager: dataManager
         )
         let sourcePodcastById = reconciliation.podcastsBySourceId
-        let destinationEpisodes = reconciliation.episodesByPodcastId
+        let destinationEpisodes = DestinationEpisodeCache(load: reconciliation.loadEpisodes)
         let sourceEpisodes = Dictionary(uniqueKeysWithValues: bundle.episodes.map { ($0.sourceEpisodeId, $0) })
 
         let presentAudio = bundle.audioRecords.filter(\.present)
@@ -928,7 +970,7 @@ enum OvercastMigration {
                 report.unresolvedAudioFiles += 1
                 continue
             }
-            let match = episodeMatch(source, in: destinationEpisodes[podcast.id] ?? [])
+            let match = episodeMatch(source, in: destinationEpisodes.episodes(for: podcast.id))
             guard let destination = match.episode else {
                 report.unresolvedAudioFiles += 1
                 report.unresolvedRecords.append(
@@ -1009,7 +1051,7 @@ enum OvercastMigration {
             dataManager: dataManager
         )
         let sourcePodcastById = reconciliation.podcastsBySourceId
-        let destinationEpisodes = reconciliation.episodesByPodcastId
+        let destinationEpisodes = DestinationEpisodeCache(load: reconciliation.loadEpisodes)
         let sourceEpisodes = Dictionary(uniqueKeysWithValues: bundle.episodes.map { ($0.sourceEpisodeId, $0) })
 
         func matched(_ ids: [Int64]) -> [PocketCastsDataModel.Episode] {
@@ -1020,7 +1062,7 @@ enum OvercastMigration {
                     report.unresolvedCollectionEpisodes += 1
                     return nil
                 }
-                let match = episodeMatch(source, in: destinationEpisodes[podcast.id] ?? [])
+                let match = episodeMatch(source, in: destinationEpisodes.episodes(for: podcast.id))
                 guard let episode = match.episode else {
                     report.unresolvedCollectionEpisodes += 1
                     report.unresolvedRecords.append(
@@ -1103,7 +1145,7 @@ enum OvercastMigration {
             dataManager: dataManager
         )
         let podcastsBySourceId = reconciliation.podcastsBySourceId
-        let episodesByPodcastId = reconciliation.episodesByPodcastId
+        let episodesByPodcastId = DestinationEpisodeCache(load: reconciliation.loadEpisodes)
         audit.matchedLibraryShows = podcastsBySourceId.count
         audit.matchedSubscriptions = bundle.subscriptions.filter {
             podcastsBySourceId[$0.sourcePodcastId] != nil
@@ -1118,7 +1160,7 @@ enum OvercastMigration {
             guard let podcast = podcastsBySourceId[source.sourcePodcastId],
                   let destination = matchingEpisode(
                       source,
-                      in: episodesByPodcastId[podcast.id] ?? []
+                      in: episodesByPodcastId.episodes(for: podcast.id)
                   )
             else { continue }
             audit.matchedStatefulEpisodes += 1
@@ -1181,7 +1223,7 @@ enum OvercastMigration {
                 else { return nil }
                 return matchingEpisode(
                     source,
-                    in: episodesByPodcastId[podcast.id] ?? []
+                    in: episodesByPodcastId.episodes(for: podcast.id)
                 )?.uuid
             }
         }
@@ -1213,7 +1255,7 @@ enum OvercastMigration {
                   let podcast = podcastsBySourceId[source.sourcePodcastId],
                   let destination = matchingEpisode(
                       source,
-                      in: episodesByPodcastId[podcast.id] ?? []
+                      in: episodesByPodcastId.episodes(for: podcast.id)
                   ),
                   destination.downloaded(pathFinder: downloadManager)
             else { continue }
