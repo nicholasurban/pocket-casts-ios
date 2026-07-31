@@ -236,6 +236,63 @@ final class OvercastMigrationTests: XCTestCase {
         return directory
     }
 
+    /// `manual_sort` lists only the episodes the user dragged into place and is
+    /// always a subset of `included_episode_ids`. Preferring it as the
+    /// membership truncated a 94-episode playlist to 4 and a 12-episode queue
+    /// to 4 during the 2026-07-30 production migration.
+    func testPlaylistKeepsFullMembershipWhenOnlySomeEpisodesAreHandSorted() throws {
+        let directory = try makeBundleDirectory()
+        try write(
+            "[{\"title\":\"Queue\",\"preset\":8,\"included_episode_ids\":\"10,11,12,13\",\"manual_sort\":\"12,10\",\"individual_episodes_only\":1,\"deleted\":0}]",
+            named: "playlists.json",
+            in: directory
+        )
+        let playlists = try JSONDecoder().decode(
+            [OvercastMigration.Playlist].self,
+            from: Data(contentsOf: directory.appendingPathComponent("playlists.json"))
+        )
+
+        // Hand-sorted episodes lead, in their chosen order; the rest follow.
+        // The old behaviour returned just [12, 10].
+        XCTAssertEqual(playlists[0].orderedEpisodeIds, [12, 10, 11, 13])
+    }
+
+    /// The mirror image of the truncation above: `manual_sort` can be far
+    /// LARGER than `included_episode_ids` (All Episodes carried 15 included
+    /// against 727 manual). Treating `included` as authoritative cut that
+    /// playlist from 691 restored episodes to 15.
+    func testPlaylistKeepsManualEntriesThatAreNotInTheIncludedList() throws {
+        let directory = try makeBundleDirectory()
+        try write(
+            "[{\"title\":\"All Episodes\",\"preset\":0,\"included_episode_ids\":\"1\",\"manual_sort\":\"7,8,9\",\"individual_episodes_only\":0,\"deleted\":0}]",
+            named: "playlists.json",
+            in: directory
+        )
+        let playlists = try JSONDecoder().decode(
+            [OvercastMigration.Playlist].self,
+            from: Data(contentsOf: directory.appendingPathComponent("playlists.json"))
+        )
+
+        XCTAssertEqual(playlists[0].orderedEpisodeIds, [7, 8, 9, 1])
+    }
+
+    /// A rule-based playlist has no explicit membership, so the manual order is
+    /// the only content there is and must still be honoured.
+    func testRuleBasedPlaylistFallsBackToManualOrder() throws {
+        let directory = try makeBundleDirectory()
+        try write(
+            "[{\"title\":\"Old\",\"preset\":0,\"included_episode_ids\":\"\",\"manual_sort\":\"5,6,7\",\"individual_episodes_only\":0,\"deleted\":0}]",
+            named: "playlists.json",
+            in: directory
+        )
+        let playlists = try JSONDecoder().decode(
+            [OvercastMigration.Playlist].self,
+            from: Data(contentsOf: directory.appendingPathComponent("playlists.json"))
+        )
+
+        XCTAssertEqual(playlists[0].orderedEpisodeIds, [5, 6, 7])
+    }
+
     private func write(_ string: String, named name: String, in directory: URL) throws {
         try Data(string.utf8).write(to: directory.appendingPathComponent(name))
     }

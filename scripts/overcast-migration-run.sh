@@ -221,7 +221,8 @@ MEMORY_LIMIT_MB="${MEMORY_LIMIT_MB:-4096}"
 MEMORY_GUARD_PID=$!
 trap 'kill "$MEMORY_GUARD_PID" 2>/dev/null || true' EXIT
 
-REPORT="$CONTAINER/Documents/OvercastMigrationQACompleteReport.txt"
+REPORT="$CONTAINER/Documents/OvercastMigrationCompleteReport.txt"
+[[ "$MODE" == "probe" ]] && REPORT="$CONTAINER/Documents/OvercastMigrationQACompleteReport.txt"
 log "Waiting for the reconciliation report"
 DEADLINE=$(( SECONDS + ${RUN_TIMEOUT:-5400} ))
 while (( SECONDS < DEADLINE )); do

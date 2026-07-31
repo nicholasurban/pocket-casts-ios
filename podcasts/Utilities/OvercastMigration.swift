@@ -253,9 +253,41 @@ enum OvercastMigration {
             deleted = try container.decodeSQLiteBooleanIfPresent(forKey: .deleted) ?? false
         }
 
+        /// The playlist's full membership, in the user's chosen order.
+        ///
+        /// `manual_sort` is Overcast's drag-to-reorder list: it holds only the
+        /// episodes the user explicitly repositioned, and is always a strict
+        /// subset of `included_episode_ids`. Treating it as the membership —
+        /// which this did until 2026-07-30 — silently truncates a playlist to
+        /// whatever happened to be hand-sorted. It rebuilt a 94-episode
+        /// playlist from 4 entries and a 12-episode queue from 4.
+        ///
+        /// So: `manual_sort` supplies the order for the episodes it names, and
+        /// the rest of the membership follows. When there is no explicit
+        /// membership the playlist is rule-based and `manual_sort` is all we
+        /// have, so it stands alone.
         var orderedEpisodeIds: [Int64] {
-            let value = (manualSort?.isEmpty == false ? manualSort : includedEpisodeIds) ?? ""
-            return value.split(separator: ",").compactMap { Int64($0) }
+            let included = (includedEpisodeIds ?? "")
+                .split(separator: ",").compactMap { Int64($0) }
+            let manual = (manualSort ?? "")
+                .split(separator: ",").compactMap { Int64($0) }
+
+            // The union, manual order first. Neither field is a superset of the
+            // other: "Biohacking Content" carries 51 included against 18
+            // manual, while "All Episodes" carries 15 included against 727
+            // manual. Treating either one as authoritative discards real
+            // membership — preferring manual truncated eleven playlists, and
+            // preferring included then cut All Episodes from 691 to 15.
+            var seen = Set<Int64>()
+            var ordered = [Int64]()
+            ordered.reserveCapacity(manual.count + included.count)
+            for id in manual where seen.insert(id).inserted {
+                ordered.append(id)
+            }
+            for id in included where seen.insert(id).inserted {
+                ordered.append(id)
+            }
+            return ordered
         }
     }
 
@@ -1085,12 +1117,27 @@ enum OvercastMigration {
             report.restoredQueueEpisodes = episodes.count
         }
 
-        let existingNames = Set(dataManager.allPlaylists(includeDeleted: false).map(\.playlistName))
+        // A playlist bearing a source playlist's name is one this migration
+        // created on an earlier run, so replace it rather than skip it.
+        //
+        // Skipping on a name collision made the migration impossible to repair:
+        // a re-run signs in, syncs the previous run's playlists down, sees the
+        // names already present, and declines to touch them. That is how the
+        // 2026-07-30 run left eleven truncated playlists in place — the fix for
+        // the truncation could not apply because the truncated playlists
+        // themselves blocked it.
+        //
+        // `createManualPlaylists` splits oversized playlists into numbered
+        // batches, so matching is by prefix as well as exact name.
         for playlist in bundle.playlists
-            where playlist.preset == 0 && !playlist.deleted && !playlist.orderedEpisodeIds.isEmpty &&
-            !existingNames.contains(playlist.title) {
+            where playlist.preset == 0 && !playlist.deleted && !playlist.orderedEpisodeIds.isEmpty {
             let episodes = matched(playlist.orderedEpisodeIds)
             guard !episodes.isEmpty else { continue }
+            for existing in dataManager.allPlaylists(includeDeleted: false)
+            where existing.playlistName == playlist.title
+                || existing.playlistName.hasPrefix("\(playlist.title) ") {
+                dataManager.delete(playlist: existing)
+            }
             report.restoredPlaylists += dataManager.createManualPlaylists(
                 from: episodes,
                 batchSize: Constants.Limits.maxFilterItems,
