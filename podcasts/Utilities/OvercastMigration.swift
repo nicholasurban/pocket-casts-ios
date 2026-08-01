@@ -1136,7 +1136,13 @@ enum OvercastMigration {
             for existing in dataManager.allPlaylists(includeDeleted: false)
             where existing.playlistName == playlist.title
                 || existing.playlistName.hasPrefix("\(playlist.title) ") {
-                dataManager.delete(playlist: existing)
+                // Go through PlaylistManager, not DataManager.delete. While
+                // signed in the former marks the row deleted and queues that
+                // for upload; the latter removes it locally only, so the
+                // server keeps the old playlist and the freshly created one
+                // lands beside it. Three runs that way left 77 filters on the
+                // account for 27 playlists, most names appearing three times.
+                PlaylistManager.delete(playlist: existing, fireEvent: false)
             }
             report.restoredPlaylists += dataManager.createManualPlaylists(
                 from: episodes,
